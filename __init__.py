@@ -74,7 +74,6 @@ class CLIP_OT_setup_camera_solver(Operator):
         camera = context.scene.camera
         clip = context.space_data.clip
 
-        # Check if a camera solver constraint already exists
         for c in camera.constraints:
             if c.type == 'CAMERA_SOLVER':
                 self.report({'INFO'}, f"Camera Solver constraint already exists on '{camera.name}'.")
@@ -82,7 +81,7 @@ class CLIP_OT_setup_camera_solver(Operator):
 
         constraint = camera.constraints.new(type='CAMERA_SOLVER')
         constraint.clip = clip
-        constraint.use_active_clip = False # Explicitly set to use the assigned clip
+        constraint.use_active_clip = False
         
         self.report({'INFO'}, f"Added Camera Solver constraint to '{camera.name}' for clip '{clip.name}'.")
         return {'FINISHED'}
@@ -91,14 +90,11 @@ class CLIP_OT_setup_camera_solver(Operator):
 class CLIP_OT_setup_object_solver(Operator):
     bl_idname = "clip.setup_object_solver"
     bl_label = "Setup Object Solver"
-    bl_description = "Adds an Object Solver constraint to the active object"
+    bl_description = "Creates a new Empty with an Object Solver constraint"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        if not context.active_object:
-            cls.poll_message_set("Requires an active object.")
-            return False
         if not (context.space_data and context.space_data.clip):
             cls.poll_message_set("Requires an active clip in the editor.")
             return False
@@ -108,7 +104,6 @@ class CLIP_OT_setup_object_solver(Operator):
             cls.poll_message_set("No active tracking object in the movie clip.")
             return False
         
-        # 'Camera'という名前のトラッキングオブジェクトがアクティブな場合は実行しない
         if active_track_obj.name == "Camera":
             cls.poll_message_set("Cannot setup Object Solver when 'Camera' track is active.")
             return False
@@ -116,32 +111,41 @@ class CLIP_OT_setup_object_solver(Operator):
         return True
 
     def execute(self, context):
-        active_obj = context.active_object
         clip = context.space_data.clip
         camera = context.scene.camera
         tracking_object = clip.tracking.objects.active
-        constraint = None
+        new_empty = None
 
         if not camera:
             self.report({'ERROR'}, "No active scene camera found. Operation cancelled.")
             return {'CANCELLED'}
 
         try:
-            constraint = active_obj.constraints.new(type='OBJECT_SOLVER')
+            # 新しいエンプティを作成
+            new_empty = bpy.data.objects.new("ObjectTrack", None)
+            new_empty.empty_display_type = 'PLAIN_AXES'
+            context.collection.objects.link(new_empty)
+
+            # 作成したエンプティにコンストレイントを追加
+            constraint = new_empty.constraints.new(type='OBJECT_SOLVER')
             constraint.clip = clip
-            constraint.use_active_clip = False # Active Clipを無効にし、指定したクリップを使用するよう明示
-            constraint.object = tracking_object.name # アクティブなトラッキングオブジェクトの名前を割り当てます
+            constraint.use_active_clip = False
+            constraint.object = tracking_object.name
             constraint.camera = camera
             
-            active_obj.location = (0.0, 0.0, 0.0)
-            active_obj.rotation_euler = (0.0, 0.0, 0.0)
+            # 作成したエンプティを選択状態にする
+            for o in context.selected_objects:
+                o.select_set(False)
+            context.view_layer.objects.active = new_empty
+            new_empty.select_set(True)
 
-            self.report({'INFO'}, f"Object Solver configured for track '{tracking_object.name}'.")
+            self.report({'INFO'}, f"Created 'ObjectTrack' Empty and configured for track '{tracking_object.name}'.")
 
         except Exception as e:
-            self.report({'ERROR'}, f"Failed to set constraint: {e}")
-            if constraint:
-                active_obj.constraints.remove(constraint)
+            self.report({'ERROR'}, f"Failed to set up Object Solver: {e}")
+            # エラーが発生した場合、作成したエンプティを削除
+            if new_empty:
+                bpy.data.objects.remove(new_empty, do_unlink=True)
             return {'CANCELLED'}
 
         return {'FINISHED'}
@@ -283,82 +287,49 @@ class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
         return has_camera and has_clip
 
     def setup_driver_variables(self, driver, imageplane, camera):
-        # This helper function sets up all the variables a driver might need.
         scene = bpy.context.scene
-        
         needed_vars = {
-            'cA': ('CAMERA', "angle", camera.data),
-            'cT': ('CAMERA', 'type', camera.data),
-            'cSx': ('CAMERA', 'shift_x', camera.data),
-            'cSy': ('CAMERA', 'shift_y', camera.data),
-            'r_x': ('SCENE', 'render.resolution_x', scene),
-            'r_y': ('SCENE', 'render.resolution_y', scene),
-            'p_x': ('SCENE', 'render.pixel_aspect_x', scene),
-            'p_y': ('SCENE', 'render.pixel_aspect_y', scene),
+            'cA': ('CAMERA', "angle", camera.data), 'cT': ('CAMERA', 'type', camera.data),
+            'cSx': ('CAMERA', 'shift_x', camera.data), 'cSy': ('CAMERA', 'shift_y', camera.data),
+            'r_x': ('SCENE', 'render.resolution_x', scene), 'r_y': ('SCENE', 'render.resolution_y', scene),
+            'p_x': ('SCENE', 'render.pixel_aspect_x', scene), 'p_y': ('SCENE', 'render.pixel_aspect_y', scene),
         }
-
         for name, (id_type, path, target_id) in needed_vars.items():
             if name not in driver.variables:
-                var = driver.variables.new()
-                var.name = name
-                var.type = 'SINGLE_PROP'
-                var.targets[0].id_type = id_type
-                var.targets[0].id = target_id
-                var.targets[0].data_path = path
-        
+                var = driver.variables.new(); var.name = name; var.type = 'SINGLE_PROP'
+                var.targets[0].id_type = id_type; var.targets[0].id = target_id; var.targets[0].data_path = path
         if 'depth' not in driver.variables:
-            var = driver.variables.new()
-            var.name = 'depth'
-            var.type = 'TRANSFORMS'
-            var.targets[0].id = imageplane
-            var.targets[0].data_path = 'location'
-            var.targets[0].transform_type = 'LOC_Z'
-            var.targets[0].transform_space = 'LOCAL_SPACE'
-
+            var = driver.variables.new(); var.name = 'depth'; var.type = 'TRANSFORMS'
+            var.targets[0].id = imageplane; var.targets[0].data_path = 'location'
+            var.targets[0].transform_type = 'LOC_Z'; var.targets[0].transform_space = 'LOCAL_SPACE'
         if 'scale_y' not in driver.variables:
-            var = driver.variables.new()
-            var.name = 'scale_y'
-            var.type = 'SINGLE_PROP'
-            var.targets[0].id = imageplane
-            var.targets[0].data_path = 'scale[1]'
+            var = driver.variables.new(); var.name = 'scale_y'; var.type = 'SINGLE_PROP'
+            var.targets[0].id = imageplane; var.targets[0].data_path = 'scale[1]'
 
     def setup_drivers_for_image_plane(self, imageplane, camera):
-        """Creates all necessary drivers for scale and location based on your perfected logic."""
-        base_expr = "abs(depth) * tan(cA/2)"
-        aspect_expr = "(r_y * p_y) / (r_x * p_x)"
-        half_width_expr = f"({base_expr})"
-        half_height_expr = f"({base_expr}) * {aspect_expr}"
-        driver_x = imageplane.driver_add('scale', 0).driver
-        driver_x.type = 'SCRIPTED'
+        base_expr = "abs(depth) * tan(cA/2)"; aspect_expr = "(r_y * p_y) / (r_x * p_x)"
+        half_width_expr = f"({base_expr})"; half_height_expr = f"({base_expr}) * {aspect_expr}"
+        driver_x = imageplane.driver_add('scale', 0).driver; driver_x.type = 'SCRIPTED'
         self.setup_driver_variables(driver_x, imageplane, camera)
         driver_x.expression = f"{half_width_expr} if cT == 0 else 0"
-        driver_y = imageplane.driver_add('scale', 1).driver
-        driver_y.type = 'SCRIPTED'
+        driver_y = imageplane.driver_add('scale', 1).driver; driver_y.type = 'SCRIPTED'
         self.setup_driver_variables(driver_y, imageplane, camera)
         driver_y.expression = f"{half_height_expr} if cT == 0 else 0"
-        driver_loc_x = imageplane.driver_add('location', 0).driver
-        driver_loc_x.type = 'SCRIPTED'
+        driver_loc_x = imageplane.driver_add('location', 0).driver; driver_loc_x.type = 'SCRIPTED'
         self.setup_driver_variables(driver_loc_x, imageplane, camera)
         driver_loc_x.expression = f"cSx * 2 * {half_width_expr}"
-        driver_loc_y = imageplane.driver_add('location', 1).driver
-        driver_loc_y.type = 'SCRIPTED'
+        driver_loc_y = imageplane.driver_add('location', 1).driver; driver_loc_y.type = 'SCRIPTED'
         self.setup_driver_variables(driver_loc_y, imageplane, camera)
         driver_loc_y.expression = f"cSy * 2 * scale_y * (r_x / r_y)"
 
     def get_frame_number_from_path(self, path):
-        """Extracts the frame number from a file path."""
         match = re.search(r'(\d+)\.\w+$', path)
-        if match:
-            return int(match.group(1))
-        return None
+        return int(match.group(1)) if match else None
 
     def create_image_plane(self, context, camera, image):
-        """Main function to create and configure the image plane."""
         try:
-            scene = context.scene
-            depth = self.depth 
-            context.view_layer.objects.active = camera
-            camera.select_set(True)
+            scene = context.scene; depth = self.depth 
+            context.view_layer.objects.active = camera; camera.select_set(True)
             bpy.ops.mesh.primitive_plane_add()
             imageplane = context.active_object
             imageplane.name = "ImagePlane_" + camera.name
@@ -369,18 +340,15 @@ class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
             material_name = 'mat_imageplane_' + image.name
             material = bpy.data.materials.get(material_name)
             if not material:
-                material = bpy.data.materials.new(name=material_name)
-                material.use_nodes = True
+                material = bpy.data.materials.new(name=material_name); material.use_nodes = True
                 material.node_tree.nodes.clear()
                 tex_image = material.node_tree.nodes.new('ShaderNodeTexImage')
                 emission = material.node_tree.nodes.new('ShaderNodeEmission')
                 transparent = material.node_tree.nodes.new('ShaderNodeBsdfTransparent')
                 mix_shader = material.node_tree.nodes.new('ShaderNodeMixShader')
                 output = material.node_tree.nodes.new('ShaderNodeOutputMaterial')
-                tex_image.location = (-300, 300)
-                emission.location = (0, 300)
-                transparent.location = (0, 0)
-                mix_shader.location = (300, 200)
+                tex_image.location = (-300, 300); emission.location = (0, 300)
+                transparent.location = (0, 0); mix_shader.location = (300, 200)
                 output.location = (600, 200)
                 links = material.node_tree.links
                 links.new(tex_image.outputs['Color'], emission.inputs['Color'])
@@ -388,45 +356,32 @@ class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
                 links.new(transparent.outputs['BSDF'], mix_shader.inputs[1])
                 links.new(emission.outputs['Emission'], mix_shader.inputs[2])
                 links.new(mix_shader.outputs['Shader'], output.inputs['Surface'])
-            
             if not imageplane.material_slots:
                 imageplane.data.materials.append(material)
             else:
                 imageplane.material_slots[0].material = material
-            
             tex_image_node = material.node_tree.nodes.get("Image Texture")
             if tex_image_node:
-                tex_image_node.image = image
-                img_user = tex_image_node.image_user
-                img_user.use_cyclic = True
-                img_user.use_auto_refresh = True
+                tex_image_node.image = image; img_user = tex_image_node.image_user
+                img_user.use_cyclic = True; img_user.use_auto_refresh = True
                 if image.source == 'SEQUENCE':
                     img_user.frame_duration = scene.frame_end - scene.frame_start + 1
                     first_frame = self.get_frame_number_from_path(image.filepath_raw)
                     if first_frame is not None:
-                        offset = first_frame - 1
-                        start_frame = scene.frame_start
-                        img_user.frame_offset = offset
-                        img_user.frame_start = start_frame
+                        img_user.frame_offset = first_frame - 1; img_user.frame_start = scene.frame_start
                     else:
-                        img_user.frame_offset = 0
-                        img_user.frame_start = scene.frame_start
+                        img_user.frame_offset = 0; img_user.frame_start = scene.frame_start
                 elif image.source == 'MOVIE':
                     img_user.frame_duration = scene.frame_end - scene.frame_start + 1
-                    img_user.frame_offset = 0
-                    img_user.frame_start = scene.frame_start
+                    img_user.frame_offset = 0; img_user.frame_start = scene.frame_start
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             self.report({'ERROR'}, f"Failed to create image plane: {e}")
             return {'CANCELLED'}
-        
-        context.view_layer.objects.active = imageplane
-        imageplane.select_set(True)
+        context.view_layer.objects.active = imageplane; imageplane.select_set(True)
         return {'FINISHED'}
 
     def execute(self, context):
-        """Operator's main execution entry point."""
         clip = context.space_data.clip
         camera = context.scene.camera
         if not camera:
@@ -453,8 +408,7 @@ class PROJECTION_OT_setup_shader(bpy.types.Operator):
         return True
     def get_frame_number_from_path(self, filepath):
         match = re.search(r'(\d+)\.\w+$', filepath);
-        if match: return int(match.group(1))
-        return None
+        return int(match.group(1)) if match else None
     def execute(self, context):
         selected_obj = context.active_object; active_camera = context.scene.camera; movie_clip = context.space_data.clip; scene = context.scene
         try:
@@ -472,7 +426,9 @@ class PROJECTION_OT_setup_shader(bpy.types.Operator):
         tex_image_node.image = image; img_user = tex_image_node.image_user; img_user.use_auto_refresh = True
         if image.source in {'SEQUENCE', 'MOVIE'}:
             img_user.use_cyclic = True; img_user.frame_duration = scene.frame_end - scene.frame_start + 1; img_user.frame_start = scene.frame_start
-            if image.source == 'SEQUENCE': first_frame = self.get_frame_number_from_path(image.filepath_raw); img_user.frame_offset = first_frame - 1 if first_frame is not None else 0
+            if image.source == 'SEQUENCE':
+                first_frame = self.get_frame_number_from_path(image.filepath_raw)
+                img_user.frame_offset = first_frame - 1 if first_frame is not None else 0
             else: img_user.frame_offset = 0
         if selected_obj.data.materials: selected_obj.data.materials[0] = material
         else: selected_obj.data.materials.append(material)
@@ -499,7 +455,6 @@ class CLIP_PT_tools_scenesetup(Panel):
         col.separator()
         col.operator(CLIP_OT_setup_camera_solver.bl_idname, icon='CON_CAMERASOLVER')
         col.operator(CLIP_OT_setup_object_solver.bl_idname, icon='CON_OBJECTSOLVER')
-
 
 # --- UI and Registration ---
 def draw_button_for_3d_markers_to_empty_panel(self, context): self.layout.operator(CLIP_OT_3d_markers_to_empty.bl_idname, icon='EMPTY_AXIS')
