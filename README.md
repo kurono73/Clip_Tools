@@ -16,7 +16,7 @@
 ---
 
 ### Setup Camera Solver
-**Location:** `Toolbar > Solve Tab > Scene Setup > Setup Camera Solver` or `Header > Clip Menus >Setup Camera Solver`
+**Location:** `Toolbar > Solve Tab > Scene Setup > Setup Camera Solver` or `Header > Clip Menus`
 
 - Adds and configures a **Camera Solver Constraint** to the active scene camera.
 - Useful when you want to set up a Camera Solver without adding extra objects typically created by Blender's **Setup Tracking Scene**.
@@ -24,7 +24,7 @@
 ---
 
 ### Setup Object Solver
-**Location:** `Toolbar > Solve Tab > Scene Setup > Setup Object Solver` or `Header > Clip Menus > Setup Object Solver`
+**Location:** `Toolbar > Solve Tab > Scene Setup > Setup Object Solver` or `Header > Clip Menus`
 
 - Creates an Empty object named **ObjectTrack** and sets up an **Object Solver Constraint**.
 - Available only when a **Tracking Object** has been added to the Movie Clip.
