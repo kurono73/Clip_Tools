@@ -15,6 +15,23 @@
 
 ---
 
+### Setup Camera Solver
+**Location:** `Toolbar > Solve Tab > Scene Setup > Setup Camera Solver` or `Header > Clip Menus >Setup Camera Solver`
+
+- Adds and configures a **Camera Solver Constraint** to the active scene camera.
+- Useful when you want to set up a Camera Solver without adding extra objects typically created by Blender's **Setup Tracking Scene**.
+
+---
+
+### Setup Object Solver
+**Location:** `Toolbar > Solve Tab > Scene Setup > Setup Object Solver` or `Header > Clip Menus > Setup Object Solver`
+
+- Creates an Empty object named **ObjectTrack** and sets up an **Object Solver Constraint**.
+- Available only when a **Tracking Object** has been added to the Movie Clip.
+- The constraint is automatically configured to use the active Tracking Object name.
+
+---
+
 ### Duplicate Active Clip
 **Location:** `Header > Clip Menus > Duplicate Active Clip`
 
@@ -35,7 +52,7 @@
 ---
 
 ### 3D Markers to Empty
-**Location:** `Toolbar > Solve > Geometry` or `Header > Reconstruction Menus`
+**Location:** `Toolbar > Solve Tab > Geometry` or `Header > Reconstruction Menus`
 
 - Converts 3D tracking markers into actual **Empty objects**, similar to other matchmoving software.
 - Especially useful when exporting to other 3D applications.
@@ -47,7 +64,7 @@
 ---
 
 ### Create Image Plane
-**Location:** `Toolbar > Solve > Geometry` or `Header > Reconstruction Menus`
+**Location:** `Toolbar > Solve Tab > Geometry` or `Header > Reconstruction Menus`
 
 - Creates an actual “image plane” in the 3D view that links the Active Movie Clip to the Active camera.
 - Supports:
@@ -60,7 +77,7 @@
 ---
 
 ### Set Camera Projection
-**Location:** `Toolbar > Solve > Geometry` or `Header > Reconstruction Menus`
+**Location:** `Toolbar > Solve Tab > Geometry` or `Header > Reconstruction Menus`
 
 - Automatically sets up a **Camera Projection Shader** on the selected mesh using the active Movie Clip and active camera.
 - Supports:
