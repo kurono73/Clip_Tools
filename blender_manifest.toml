@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "Scene_Duration_Display"
+version = "1.0.0"
+name = "Scene Duration Display"
+tagline = "Displays and syncs timeline duration. Set preview range with I/O"
+maintainer = "Naoki Korematsu" 
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Animation"]
