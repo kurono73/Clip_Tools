@@ -11,15 +11,40 @@ import math
 from mathutils import Matrix
 from bpy.types import Operator, Panel
 
-# --- Helper Functions (No changes) ---
+# --- Helper Functions ---
+
+def is_clip_editor_with_active_clip(context):
+    """Checks if the context is the Clip Editor with an active clip."""
+    space = context.space_data
+    return space and space.type == 'CLIP_EDITOR' and space.clip is not None
+
+def get_frame_number_from_path(filepath):
+    """Extracts the frame number sequence from the end of a filepath string."""
+    if not filepath:
+        return None
+    # This regex specifically looks for a number sequence right before the file extension.
+    match = re.search(r'(\d+)\.\w+$', filepath)
+    return int(match.group(1)) if match else None
+
 def create_projection_node_group(camera_obj):
+    """
+    Creates a shader node group for camera projection.
+    If a group for the given camera already exists, it will be replaced.
+    """
     group_name = f"Camera Project | {camera_obj.name}"
     if group_name in bpy.data.node_groups:
         bpy.data.node_groups.remove(bpy.data.node_groups[group_name])
+        
     group = bpy.data.node_groups.new(name=group_name, type='ShaderNodeTree')
     group.interface.new_socket(name="Vector", in_out="OUTPUT", socket_type='NodeSocketVector')
-    nodes = group.nodes; links = group.links
+    
+    nodes = group.nodes
+    links = group.links
+    
+    # Node layout columns
     col1, col2, col3, col4, col5, col6, col7, col8 = -600, -400, -200, 0, 250, 500, 750, 950
+
+    # Node creation (Layout remains improved for readability)
     tex_coord = nodes.new("ShaderNodeTexCoord"); tex_coord.label = "Camera Transform"; tex_coord.location = (col1, 200); tex_coord.object = camera_obj
     val_lens = nodes.new("ShaderNodeValue"); val_lens.label = "Lens"; val_lens.location = (col1, 0)
     val_sensor = nodes.new("ShaderNodeValue"); val_sensor.label = "Sensor Width"; val_sensor.location = (col1, -150)
@@ -43,26 +68,51 @@ def create_projection_node_group(camera_obj):
     vec_math_user_transforms = nodes.new("ShaderNodeVectorMath"); vec_math_user_transforms.label = "User Transforms"; vec_math_user_transforms.operation = 'MULTIPLY'; vec_math_user_transforms.location = (col7, 0)
     vec_math_recenter = nodes.new("ShaderNodeVectorMath"); vec_math_recenter.label = "Recenter"; vec_math_recenter.operation = 'ADD'; vec_math_recenter.inputs[1].default_value = (0.5, 0.5, 0.0); vec_math_recenter.location = (col8, 0)
     output_node = nodes.new('NodeGroupOutput'); output_node.location = (col8 + 200, 0)
+    
+    # Linking nodes
     links.new(tex_coord.outputs['Object'], sep_xyz_persp.inputs['Vector']); links.new(sep_xyz_persp.outputs['X'], math_persp2.inputs[0]); links.new(sep_xyz_persp.outputs['Y'], math_persp3.inputs[0]); links.new(sep_xyz_persp.outputs['Z'], math_persp2.inputs[1]); links.new(sep_xyz_persp.outputs['Z'], math_persp3.inputs[1]); links.new(sep_xyz_persp.outputs['Z'], combo_persp4.inputs['Z']); links.new(math_persp2.outputs['Value'], combo_persp4.inputs['X']); links.new(math_persp3.outputs['Value'], combo_persp4.inputs['Y']); links.new(val_lens.outputs['Value'], math_zoom1.inputs[0]); links.new(val_sensor.outputs['Value'], math_zoom1.inputs[1]); links.new(math_zoom1.outputs['Value'], math_zoom2.inputs[0]); links.new(val_shift_x.outputs['Value'], combo_shift1.inputs['X']); links.new(val_shift_y.outputs['Value'], combo_shift1.inputs['Y']); links.new(val_resolution.outputs['Value'], math_aspect_div.inputs[1]); links.new(val_resolution.outputs['Value'], math_aspect_lt.inputs[0]); links.new(val_resolution.outputs['Value'], combo_aspect1.inputs['Y']); links.new(combo_persp4.outputs['Vector'], vec_math_zoom3.inputs[0]); links.new(math_zoom2.outputs['Value'], vec_math_zoom3.inputs[1]); links.new(math_aspect_div.outputs['Value'], combo_aspect2.inputs['X']); links.new(vec_math_zoom3.outputs['Vector'], vec_math_shift2.inputs[0]); links.new(combo_shift1.outputs['Vector'], vec_math_shift2.inputs[1]); links.new(math_aspect_lt.outputs['Value'], mix_aspect_switch.inputs[0]); links.new(combo_aspect1.outputs['Vector'], mix_aspect_switch.inputs[6]); links.new(combo_aspect2.outputs['Vector'], mix_aspect_switch.inputs[7]); links.new(mix_aspect_switch.outputs[2], vec_math_user_transforms.inputs[1]); links.new(vec_math_shift2.outputs['Vector'], vec_math_user_transforms.inputs[0]); links.new(vec_math_user_transforms.outputs['Vector'], vec_math_recenter.inputs[0]); links.new(vec_math_recenter.outputs['Vector'], output_node.inputs['Vector'])
+    
     value_nodes_to_drive = {"lens": val_lens, "sensor": val_sensor, "shift_x": val_shift_x, "shift_y": val_shift_y, "resolution": val_resolution}
     setup_drivers_for_group(value_nodes_to_drive, camera_obj)
+    
     return group
 
 def setup_drivers_for_group(nodes_to_drive, camera_obj):
+    """Sets up drivers for the value nodes within the projection node group. (Original Logic)"""
     def add_driver(node, data_path):
-        driver = node.outputs[0].driver_add('default_value').driver; var = driver.variables.new(); var.name = "var"
-        var.targets[0].id_type = 'CAMERA'; var.targets[0].id = camera_obj.data; var.targets[0].data_path = data_path
+        driver = node.outputs[0].driver_add('default_value').driver
+        var = driver.variables.new()
+        var.name = "var"
+        var.targets[0].id_type = 'CAMERA'
+        var.targets[0].id = camera_obj.data
+        var.targets[0].data_path = data_path
         driver.expression = "var"
-    add_driver(nodes_to_drive["lens"], "lens"); add_driver(nodes_to_drive["sensor"], "sensor_width")
-    add_driver(nodes_to_drive["shift_x"], "shift_x"); add_driver(nodes_to_drive["shift_y"], "shift_y")
+        
+    add_driver(nodes_to_drive["lens"], "lens")
+    add_driver(nodes_to_drive["sensor"], "sensor_width")
+    add_driver(nodes_to_drive["shift_x"], "shift_x")
+    add_driver(nodes_to_drive["shift_y"], "shift_y")
+    
     res_driver = nodes_to_drive["resolution"].outputs[0].driver_add('default_value').driver
     res_driver.expression = "res_x / res_y if res_y != 0 else 1.0"
-    var_x = res_driver.variables.new(); var_x.name = "res_x"; var_x.targets[0].id_type = 'SCENE'; var_x.targets[0].id = bpy.context.scene; var_x.targets[0].data_path = "render.resolution_x"
-    var_y = res_driver.variables.new(); var_y.name = "res_y"; var_y.targets[0].id_type = 'SCENE'; var_y.targets[0].id = bpy.context.scene; var_y.targets[0].data_path = "render.resolution_y"
+    
+    var_x = res_driver.variables.new()
+    var_x.name = "res_x"
+    var_x.targets[0].id_type = 'SCENE'
+    var_x.targets[0].id = bpy.context.scene
+    var_x.targets[0].data_path = "render.resolution_x"
+    
+    var_y = res_driver.variables.new()
+    var_y.name = "res_y"
+    var_y.targets[0].id_type = 'SCENE'
+    var_y.targets[0].id = bpy.context.scene
+    var_y.targets[0].data_path = "render.resolution_y"
 
-# --- Operator Classes ---
+
+# --- Operator Classes (Formatted with Docstrings) ---
 
 class CLIP_OT_setup_camera_solver(Operator):
+    """Adds a Camera Solver constraint to the active camera for the current clip."""
     bl_idname = "clip.setup_camera_solver"
     bl_label = "Setup Camera Solver"
     bl_description = "Adds a Camera Solver constraint to the active camera"
@@ -70,26 +120,24 @@ class CLIP_OT_setup_camera_solver(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.camera and context.space_data and context.space_data.clip
+        return context.scene.camera and is_clip_editor_with_active_clip(context)
 
     def execute(self, context):
         camera = context.scene.camera
         clip = context.space_data.clip
-
         for c in camera.constraints:
             if c.type == 'CAMERA_SOLVER':
                 self.report({'INFO'}, f"Camera Solver constraint already exists on '{camera.name}'.")
                 return {'CANCELLED'}
-
         constraint = camera.constraints.new(type='CAMERA_SOLVER')
         constraint.clip = clip
         constraint.use_active_clip = False
-        
         self.report({'INFO'}, f"Added Camera Solver constraint to '{camera.name}' for clip '{clip.name}'.")
         return {'FINISHED'}
 
 
 class CLIP_OT_setup_object_solver(Operator):
+    """Creates a new Empty with an Object Solver constraint for the active tracking object."""
     bl_idname = "clip.setup_object_solver"
     bl_label = "Setup Object Solver"
     bl_description = "Creates a new Empty with an Object Solver constraint"
@@ -97,19 +145,16 @@ class CLIP_OT_setup_object_solver(Operator):
 
     @classmethod
     def poll(cls, context):
-        if not (context.space_data and context.space_data.clip):
+        if not is_clip_editor_with_active_clip(context):
             cls.poll_message_set("Requires an active clip in the editor.")
             return False
-            
         active_track_obj = context.space_data.clip.tracking.objects.active
         if not active_track_obj:
             cls.poll_message_set("No active tracking object in the movie clip.")
             return False
-        
         if active_track_obj.name == "Camera":
             cls.poll_message_set("Cannot setup Object Solver when 'Camera' track is active.")
             return False
-            
         return True
 
     def execute(self, context):
@@ -117,51 +162,41 @@ class CLIP_OT_setup_object_solver(Operator):
         camera = context.scene.camera
         tracking_object = clip.tracking.objects.active
         new_empty = None
-
         if not camera:
             self.report({'ERROR'}, "No active scene camera found. Operation cancelled.")
             return {'CANCELLED'}
-
         try:
-            # 新しいエンプティを作成
             new_empty = bpy.data.objects.new("ObjectTrack", None)
             new_empty.empty_display_type = 'PLAIN_AXES'
             context.collection.objects.link(new_empty)
-
-            # 作成したエンプティにコンストレイントを追加
             constraint = new_empty.constraints.new(type='OBJECT_SOLVER')
             constraint.clip = clip
             constraint.use_active_clip = False
             constraint.object = tracking_object.name
             constraint.camera = camera
-            
-            # 作成したエンプティを選択状態にする
             for o in context.selected_objects:
                 o.select_set(False)
             context.view_layer.objects.active = new_empty
             new_empty.select_set(True)
-
             self.report({'INFO'}, f"Created 'ObjectTrack' Empty and configured for track '{tracking_object.name}'.")
-
         except Exception as e:
             self.report({'ERROR'}, f"Failed to set up Object Solver: {e}")
-            # エラーが発生した場合、作成したエンプティを削除
             if new_empty:
                 bpy.data.objects.remove(new_empty, do_unlink=True)
             return {'CANCELLED'}
-
         return {'FINISHED'}
 
 
 class CLIP_OT_3d_markers_to_empty(Operator):
+    """Creates an Empty at the 3D position of each selected track with reconstructed 3D data."""
     bl_idname = "clip.3d_markers_to_empty"
     bl_label = "3D Markers to Empty"
+    bl_description = "Creates Empties from selected tracks with 3D reconstruction data"
     bl_options = {'REGISTER', 'UNDO'}
     
     @classmethod
     def poll(cls, context):
-        sc = context.space_data
-        return sc and (sc.type == 'CLIP_EDITOR') and sc.clip
+        return is_clip_editor_with_active_clip(context)
         
     def execute(self, context):
         sc = context.space_data
@@ -170,25 +205,20 @@ class CLIP_OT_3d_markers_to_empty(Operator):
         if not tracking_object:
             self.report({'ERROR'}, "No active tracking object found.")
             return {'CANCELLED'}
-            
         scene = context.scene
         camera = scene.camera
         world_matrix = Matrix.Identity(4)
-        
         if camera:
             reconstruction = tracking_object.reconstruction
             if reconstruction and reconstruction.is_valid:
                 relative_frame = scene.frame_current - clip.frame_start + 1
                 reconstructed_matrix = reconstruction.cameras.matrix_from_frame(frame=relative_frame)
-                
                 if reconstructed_matrix:
                     world_matrix = camera.matrix_world @ reconstructed_matrix.inverted()
-        
         parent_empty = bpy.data.objects.new("Trackpoint", None)
         parent_empty.empty_display_type = 'PLAIN_AXES'
         parent_empty.empty_display_size = 1.0 
         context.collection.objects.link(parent_empty)
-
         created_empties = []
         for i, track in enumerate(tracking_object.tracks):
             if track.has_bundle and track.select:
@@ -199,7 +229,6 @@ class CLIP_OT_3d_markers_to_empty(Operator):
                 context.collection.objects.link(empty)
                 empty.parent = parent_empty
                 created_empties.append(empty)
-                
                 d = empty.driver_add("empty_display_size").driver
                 var = d.variables.new()
                 var.name = "size"
@@ -207,24 +236,26 @@ class CLIP_OT_3d_markers_to_empty(Operator):
                 var.targets[0].id = parent_empty
                 var.targets[0].data_path = 'empty_display_size'
                 d.expression = "size"
-
         parent_empty.location = (0, 0, 0)
-
         if not created_empties:
             if parent_empty.users == 1 and parent_empty.name in bpy.data.objects:
                 bpy.data.objects.remove(parent_empty, do_unlink=True)
             self.report({'WARNING'}, "No selected tracks with 3D data found.")
             return {'CANCELLED'}
-
         self.report({'INFO'}, f"{len(created_empties)} Empties created. Select 'Trackpoint' parent to change size via Object Data Properties.")
         return {'FINISHED'}
 
 class CLIP_OT_set_start_frame_from_filename(bpy.types.Operator):
-    bl_idname = "clip.set_start_frame_from_filename"; bl_label = "Set Start Seq No."; bl_description = "Sets clip start frame from a number in its name (e.g., 'clip.####.ext' or 'clip_####.ext')"; bl_options = {'REGISTER', 'UNDO'}
+    """Sets the clip's start frame from a number in its filename."""
+    bl_idname = "clip.set_start_frame_from_filename"
+    bl_label = "Set Start Seq No."
+    bl_description = "Sets clip start frame from a number in its name (e.g., 'clip.####.ext' or 'clip_####.ext')"
+    bl_options = {'REGISTER', 'UNDO'}
+
     @classmethod
     def poll(cls, context):
-        if context.area and context.area.type == 'CLIP_EDITOR': space = context.space_data; return space and hasattr(space, 'clip') and space.clip is not None
-        return False
+        return is_clip_editor_with_active_clip(context)
+        
     def execute(self, context):
         clip = context.space_data.clip; name_to_parse = clip.name
         match = re.search(r"[._](\d{4,})\.", name_to_parse)
@@ -238,11 +269,16 @@ class CLIP_OT_set_start_frame_from_filename(bpy.types.Operator):
         return {'FINISHED'}
 
 class CLIP_OT_duplicate_active_movieclip(bpy.types.Operator):
-    bl_idname = "clip.duplicate_active_movieclip"; bl_label = "Duplicate Active Clip"; bl_description = "Creates a copy of the currently active Movie Clip data-block"; bl_options = {'REGISTER', 'UNDO'}
+    """Creates a copy of the currently active Movie Clip data-block."""
+    bl_idname = "clip.duplicate_active_movieclip"
+    bl_label = "Duplicate Active Clip"
+    bl_description = "Creates a copy of the currently active Movie Clip data-block"
+    bl_options = {'REGISTER', 'UNDO'}
+    
     @classmethod
     def poll(cls, context):
-        if context.area and context.area.type == 'CLIP_EDITOR': space = context.space_data; return space and hasattr(space, 'clip') and space.clip is not None
-        return False
+        return is_clip_editor_with_active_clip(context)
+
     def execute(self, context):
         space_clip = context.space_data; source_clip = space_clip.clip
         if source_clip is None: self.report({'WARNING'}, "No active Movie Clip to duplicate."); return {'CANCELLED'}
@@ -253,12 +289,16 @@ class CLIP_OT_duplicate_active_movieclip(bpy.types.Operator):
         return {'FINISHED'}
 
 class CLIP_OT_delete_active_movieclip(bpy.types.Operator):
-    bl_idname = "clip.delete_active_movieclip"; bl_label = "Delete Active Clip"; bl_description = "Deletes the active Movie Clip. This action can be undone, but the data-block might be lost if not used elsewhere and the file is saved."; bl_options = {'REGISTER', 'UNDO'}
+    """Deletes the active Movie Clip data-block."""
+    bl_idname = "clip.delete_active_movieclip"
+    bl_label = "Delete Active Clip"
+    bl_description = "Deletes the active Movie Clip. This action can be undone, but the data-block might be lost if not used elsewhere and the file is saved."
+    bl_options = {'REGISTER', 'UNDO'}
+
     @classmethod
     def poll(cls, context):
-        if context.area and context.area.type == 'CLIP_EDITOR':
-            space = context.space_data; return space and hasattr(space, 'clip') and space.clip is not None
-        return False
+        return is_clip_editor_with_active_clip(context)
+
     def execute(self, context):
         space_clip = context.space_data; clip_to_delete = space_clip.clip
         if clip_to_delete is None: self.report({'WARNING'}, "No active Movie Clip to delete."); return {'CANCELLED'}
@@ -270,6 +310,7 @@ class CLIP_OT_delete_active_movieclip(bpy.types.Operator):
         return {'FINISHED'}
 
 class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
+    """Creates a camera-parented plane that matches the camera's view, using the active clip as its texture."""
     bl_idname = "clip.create_image_plane_from_clip"
     bl_label = "Create Image Plane"
     bl_options = {'REGISTER', 'UNDO'}
@@ -285,10 +326,10 @@ class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         has_camera = context.scene.camera is not None
-        has_clip = context.space_data.clip is not None
-        return has_camera and has_clip
+        return has_camera and is_clip_editor_with_active_clip(context)
 
     def setup_driver_variables(self, driver, imageplane, camera):
+        """Sets up the necessary variables for the image plane drivers. (Original Logic)"""
         scene = bpy.context.scene
         needed_vars = {
             'cA': ('CAMERA', "angle", camera.data), 'cT': ('CAMERA', 'type', camera.data),
@@ -309,26 +350,28 @@ class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
             var.targets[0].id = imageplane; var.targets[0].data_path = 'scale[1]'
 
     def setup_drivers_for_image_plane(self, imageplane, camera):
+        """Sets up the drivers for the image plane's scale and location. (Original Logic)"""
         base_expr = "abs(depth) * tan(cA/2)"; aspect_expr = "(r_y * p_y) / (r_x * p_x)"
         half_width_expr = f"({base_expr})"; half_height_expr = f"({base_expr}) * {aspect_expr}"
+        
         driver_x = imageplane.driver_add('scale', 0).driver; driver_x.type = 'SCRIPTED'
         self.setup_driver_variables(driver_x, imageplane, camera)
         driver_x.expression = f"{half_width_expr} if cT == 0 else 0"
+        
         driver_y = imageplane.driver_add('scale', 1).driver; driver_y.type = 'SCRIPTED'
         self.setup_driver_variables(driver_y, imageplane, camera)
         driver_y.expression = f"{half_height_expr} if cT == 0 else 0"
+        
         driver_loc_x = imageplane.driver_add('location', 0).driver; driver_loc_x.type = 'SCRIPTED'
         self.setup_driver_variables(driver_loc_x, imageplane, camera)
         driver_loc_x.expression = f"cSx * 2 * {half_width_expr}"
+        
         driver_loc_y = imageplane.driver_add('location', 1).driver; driver_loc_y.type = 'SCRIPTED'
         self.setup_driver_variables(driver_loc_y, imageplane, camera)
         driver_loc_y.expression = f"cSy * 2 * scale_y * (r_x / r_y)"
 
-    def get_frame_number_from_path(self, path):
-        match = re.search(r'(\d+)\.\w+$', path)
-        return int(match.group(1)) if match else None
-
     def create_image_plane(self, context, camera, image):
+        """Creates and configures the image plane object and its material."""
         try:
             scene = context.scene; depth = self.depth 
             context.view_layer.objects.active = camera; camera.select_set(True)
@@ -368,7 +411,7 @@ class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
                 img_user.use_cyclic = True; img_user.use_auto_refresh = True
                 if image.source == 'SEQUENCE':
                     img_user.frame_duration = scene.frame_end - scene.frame_start + 1
-                    first_frame = self.get_frame_number_from_path(image.filepath_raw)
+                    first_frame = get_frame_number_from_path(image.filepath_raw)
                     if first_frame is not None:
                         img_user.frame_offset = first_frame - 1; img_user.frame_start = scene.frame_start
                     else:
@@ -399,18 +442,19 @@ class CLIP_OT_create_image_plane_from_clip(bpy.types.Operator):
         return self.create_image_plane(context, camera, image)
 
 class PROJECTION_OT_setup_shader(bpy.types.Operator):
-    bl_idname = "object.setup_projection_shader"; bl_label = "Set Cam Projection"; bl_options = {'REGISTER', 'UNDO'}
+    """Creates a camera projection material for the selected object."""
+    bl_idname = "object.setup_projection_shader"
+    bl_label = "Set Cam Projection"
+    bl_options = {'REGISTER', 'UNDO'}
     @classmethod
     def poll(cls, context):
         active_obj = context.active_object
         if not active_obj: cls.poll_message_set("Please select an object"); return False
         if active_obj.type != 'MESH': cls.poll_message_set("Please select a MESH object"); return False
         if not context.scene.camera: cls.poll_message_set("Please set an active camera in the scene"); return False
-        if not (hasattr(context.space_data, 'clip') and context.space_data.clip): cls.poll_message_set("Please open a clip in the Movie Clip Editor"); return False
+        if not is_clip_editor_with_active_clip(context): cls.poll_message_set("Please open a clip in the Movie Clip Editor"); return False
         return True
-    def get_frame_number_from_path(self, filepath):
-        match = re.search(r'(\d+)\.\w+$', filepath);
-        return int(match.group(1)) if match else None
+        
     def execute(self, context):
         selected_obj = context.active_object; active_camera = context.scene.camera; movie_clip = context.space_data.clip; scene = context.scene
         try:
@@ -429,7 +473,7 @@ class PROJECTION_OT_setup_shader(bpy.types.Operator):
         if image.source in {'SEQUENCE', 'MOVIE'}:
             img_user.use_cyclic = True; img_user.frame_duration = scene.frame_end - scene.frame_start + 1; img_user.frame_start = scene.frame_start
             if image.source == 'SEQUENCE':
-                first_frame = self.get_frame_number_from_path(image.filepath_raw)
+                first_frame = get_frame_number_from_path(image.filepath_raw)
                 img_user.frame_offset = first_frame - 1 if first_frame is not None else 0
             else: img_user.frame_offset = 0
         if selected_obj.data.materials: selected_obj.data.materials[0] = material
@@ -438,6 +482,7 @@ class PROJECTION_OT_setup_shader(bpy.types.Operator):
 
 # --- UI Panels ---
 class CLIP_PT_tools_scenesetup(Panel):
+    """UI Panel for general scene setup tools related to tracking."""
     bl_space_type = 'CLIP_EDITOR'
     bl_region_type = 'TOOLS'
     bl_label = "Scene Setup"
@@ -496,6 +541,7 @@ ui_additions = [
 ]
 
 def register():
+    """Registers all addon classes and appends UI elements."""
     for cls in classes_to_register: bpy.utils.register_class(cls)
     for target_classname, draw_func in ui_additions:
         try:
@@ -504,11 +550,12 @@ def register():
         except Exception as e: print(f"ERROR appending {draw_func.__name__} to {target_classname}: {e}")
 
 def unregister():
+    """Unregisters all addon classes and removes UI elements."""
     for target_classname, draw_func in ui_additions:
         try:
             target_class = getattr(bpy.types, target_classname, None)
             if target_class and hasattr(target_class, "remove"): target_class.remove(draw_func)
-        except Exception: pass
+        except (AttributeError, RuntimeError): pass
     for cls in reversed(classes_to_register): bpy.utils.unregister_class(cls)
 
 if __name__ == "__main__":
