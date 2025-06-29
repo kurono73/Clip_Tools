@@ -74,6 +74,9 @@
 
 - Useful for workflows similar to Maya's image plane system.
 
+> **Note for Blender 4.4 and Later:** 
+Due to changes in driver and dependency graph evaluation in Blender 4.4, driver-based setups may become unstable or display visual glitches during playback.
+
 ---
 
 ### Set Camera Projection
