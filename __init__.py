@@ -1,3 +1,5 @@
+# Clip_Tools
+
 # Authors (Original & Contributors):
 # - Create Image Plane: Torbjörn Westerlund, Vladimir Spivak (cwolf3d) (from the Camera Image Plane for Blender 2.80+ addon)
 # - Camera Projection Shader Concept: Nathan Vegdahl, Ian Hubert (from the Compify addon)
