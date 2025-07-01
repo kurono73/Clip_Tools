@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "Clip_Tools"
-version = "1.0.0"
+version = "1.0.1"
 name = "Clip Tools"
 tagline = "Add a simple tool to the Movie Clip Editor"
 maintainer = "Naoki Korematsu" 
