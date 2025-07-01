@@ -557,8 +557,3 @@ def unregister():
             if target_class and hasattr(target_class, "remove"): target_class.remove(draw_func)
         except (AttributeError, RuntimeError): pass
     for cls in reversed(classes_to_register): bpy.utils.unregister_class(cls)
-
-if __name__ == "__main__":
-    try: unregister()
-    except RuntimeError: pass
-    register()
