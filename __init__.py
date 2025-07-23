@@ -258,7 +258,7 @@ class CLIP_OT_set_start_frame_from_filename(bpy.types.Operator):
         
     def execute(self, context):
         clip = context.space_data.clip; name_to_parse = clip.name
-        match = re.search(r"[._](\d{4,})\.", name_to_parse)
+        match = re.search(r'[._](\d+)\.\w+$', name_to_parse)
         if match:
             try: frame_start = int(match.group(1))
             except ValueError: self.report({'ERROR'}, f"Could not convert matched pattern '{match.group(1)}' to an integer."); return {'CANCELLED'}
