@@ -94,4 +94,24 @@ Due to changes in driver and dependency graph evaluation in Blender 4.4, driver-
 
 > **Note:** Texture projection is not displayed in Solid View. Please use Material Preview or Rendered modes.
 
+
 ---
+
+### Orientation Plus
+**Location:** `Toolbar > Solve Tab >Orientation Plus`  
+- Orientation Plus provides an extended orientation workflow for solved Movie Clips. Unlike Blender’s standard Floor and Wall tools, it can use one or more selected reconstructed trackers and align their contact plane while preserving the current camera orientation as much as possible.
+
+- Choose the target plane from **Target Surface**. Use `+Z/-Z Floor` for floor alignment, or `+X/-X/+Y/-Y Wall` for wall alignment.
+
+- Use **Position Mode** to decide how the plane is placed:
+  - **Move Plane To** moves the selected tracker center to the chosen coordinate.
+  - **Keep Camera XY** keeps the camera X/Y position and uses the chosen coordinate’s Z value as the height.
+
+- The coordinate can come from the world origin, the 3D cursor, or a manual XYZ value. For multiple trackers, **Track Center** can use either Average or Median.
+
+- Tracker selection:
+  - 1 tracker: position only
+  - 2 trackers: constrained angle correction
+  - 3 or more trackers: fitted plane alignment
+
+- Use this after re-tracking or re-solving when you want to re-align the scene contact plane without rebuilding the orientation from scratch.
