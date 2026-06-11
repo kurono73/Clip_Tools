@@ -8,7 +8,7 @@
 import bpy
 import re
 import math
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 from bpy.types import Operator, Panel
 
 # --- Helper Functions ---
@@ -25,6 +25,369 @@ def get_frame_number_from_path(filepath):
     # This regex specifically looks for a number sequence right before the file extension.
     match = re.search(r'(\d+)\.\w+$', filepath)
     return int(match.group(1)) if match else None
+
+def constraint_uses_clip(constraint, clip):
+    if constraint.type not in {'CAMERA_SOLVER', 'OBJECT_SOLVER'}:
+        return False
+    return constraint.use_active_clip or constraint.clip == clip
+
+def get_camera_with_movieclip(context, clip):
+    def camera_uses_movieclip(obj):
+        return (
+            obj and
+            obj.type == 'CAMERA' and
+            any(constraint_uses_clip(con, clip) for con in obj.constraints)
+        )
+
+    scene_camera = context.scene.camera
+    if camera_uses_movieclip(scene_camera):
+        return scene_camera
+
+    for obj in bpy.data.objects:
+        if camera_uses_movieclip(obj):
+            return obj
+
+    return None
+
+def get_orientation_plus_object(context, clip, tracking_object):
+    if tracking_object.is_camera:
+        obj = get_camera_with_movieclip(context, clip)
+    else:
+        obj = context.view_layer.objects.active
+
+    if obj and obj.parent:
+        return obj.parent
+    return obj
+
+def get_clip_reconstruction_world_matrix(context, clip, tracking_object, camera=None):
+    """Returns the matrix that maps reconstructed bundles into the scene."""
+    camera = camera or get_camera_with_movieclip(context, clip)
+    if not camera:
+        return Matrix.Identity(4)
+
+    reconstruction = tracking_object.reconstruction
+    if not reconstruction or not reconstruction.is_valid:
+        return Matrix.Identity(4)
+
+    relative_frame = context.scene.frame_current - clip.frame_start + 1
+    reconstructed_matrix = reconstruction.cameras.matrix_from_frame(frame=relative_frame)
+    if not reconstructed_matrix:
+        return Matrix.Identity(4)
+
+    return camera.matrix_world @ reconstructed_matrix.inverted()
+
+def get_selected_reconstructed_points(context, camera=None):
+    """Gets selected reconstructed track bundle positions in world space."""
+    clip = context.space_data.clip
+    tracking_object = clip.tracking.objects.active
+    if not tracking_object:
+        return []
+
+    world_matrix = get_clip_reconstruction_world_matrix(context, clip, tracking_object, camera)
+    return [
+        world_matrix @ track.bundle
+        for track in tracking_object.tracks
+        if track.select and track.has_bundle
+    ]
+
+def get_evaluated_reconstructed_points(context, clip, tracking_object, camera, orientation_object, frame=None):
+    """Gets selected reconstructed points using solved object matrices at the requested frame."""
+    scene = context.scene
+    original_frame = scene.frame_current
+    if frame is not None and original_frame != frame:
+        scene.frame_set(frame)
+
+    try:
+        context.view_layer.update()
+        depsgraph = context.evaluated_depsgraph_get()
+        camera_matrix = camera.evaluated_get(depsgraph).matrix_world.copy()
+        orientation_matrix = orientation_object.evaluated_get(depsgraph).matrix_world.copy()
+        reconstruction = tracking_object.reconstruction
+        reconstructed_matrix = None
+        if reconstruction and reconstruction.is_valid:
+            relative_frame = scene.frame_current - clip.frame_start + 1
+            reconstructed_matrix = reconstruction.cameras.matrix_from_frame(frame=relative_frame)
+
+        if not reconstructed_matrix:
+            return None, camera_matrix, orientation_matrix
+
+        world_matrix = camera_matrix @ reconstructed_matrix.inverted()
+
+        points = [
+            world_matrix @ track.bundle
+            for track in tracking_object.tracks
+            if track.select and track.has_bundle
+        ]
+    finally:
+        if frame is not None and original_frame != frame:
+            scene.frame_set(original_frame)
+            context.view_layer.update()
+
+    return points, camera_matrix, orientation_matrix
+
+def median_scalar(values):
+    values = sorted(values)
+    count = len(values)
+    middle = count // 2
+    if count % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) * 0.5
+
+def reduce_points(points, method):
+    if method == 'MEDIAN':
+        return Vector((
+            median_scalar([point.x for point in points]),
+            median_scalar([point.y for point in points]),
+            median_scalar([point.z for point in points]),
+        ))
+
+    center = Vector((0.0, 0.0, 0.0))
+    for point in points:
+        center += point
+    return center / len(points)
+
+def fit_plane_normal(points, center):
+    seed = None
+    for i in range(len(points) - 2):
+        a = points[i] - center
+        for j in range(i + 1, len(points) - 1):
+            b = points[j] - center
+            for k in range(j + 1, len(points)):
+                c = points[k] - center
+                normal = (b - a).cross(c - a)
+                if normal.length > 1.0e-8:
+                    seed = normal.normalized()
+                    break
+            if seed:
+                break
+        if seed:
+            break
+
+    if not seed:
+        return None
+
+    normal_sum = Vector((0.0, 0.0, 0.0))
+    for i in range(len(points) - 1):
+        a = points[i] - center
+        for j in range(i + 1, len(points)):
+            normal = a.cross(points[j] - center)
+            if normal.length <= 1.0e-8:
+                continue
+            if normal.dot(seed) < 0.0:
+                normal.negate()
+            normal_sum += normal
+
+    if normal_sum.length <= 1.0e-8:
+        return seed
+    return normal_sum.normalized()
+
+def orient_normal_toward_camera(normal, point_on_plane, camera_matrix):
+    camera_direction = camera_matrix.translation - point_on_plane
+    if camera_direction.length <= 1.0e-8:
+        return normal.normalized()
+
+    normal = normal.normalized()
+    if normal.dot(camera_direction) < 0.0:
+        normal.negate()
+    return normal
+
+def translate_orientation_object_world(obj, delta):
+    if obj.parent:
+        local_delta = obj.parent.matrix_world.inverted().to_3x3() @ delta
+    else:
+        local_delta = delta
+    obj.location += local_delta
+
+def set_orientation_object_world_matrix(obj, matrix):
+    if obj.parent:
+        obj.matrix_basis = obj.parent.matrix_world.inverted() @ matrix
+    else:
+        obj.matrix_basis = matrix
+
+def transform_orientation_object(obj, transform, base_matrix=None):
+    matrix = base_matrix if base_matrix is not None else obj.matrix_world.copy()
+    set_orientation_object_world_matrix(obj, transform @ matrix)
+
+def get_orientation_plus_axis(settings, camera):
+    # Wall labels describe the camera-facing side; the solver uses the opposite plane normal.
+    axes = {
+        'Z_POS': Vector((0.0, 0.0, 1.0)),
+        'Z_NEG': Vector((0.0, 0.0, -1.0)),
+        'X_POS': Vector((-1.0, 0.0, 0.0)),
+        'X_NEG': Vector((1.0, 0.0, 0.0)),
+        'Y_POS': Vector((0.0, -1.0, 0.0)),
+        'Y_NEG': Vector((0.0, 1.0, 0.0)),
+    }
+
+    return axes[settings.contact_direction]
+
+def get_orientation_plus_coordinate(settings, scene):
+    if settings.coordinate_source == 'ORIGIN':
+        return Vector((0.0, 0.0, 0.0))
+    if settings.coordinate_source == 'CURSOR':
+        return scene.cursor.location.copy()
+    return Vector(settings.contact_origin)
+
+def get_orientation_plus_target_point(settings, scene, camera_matrix):
+    input_point = get_orientation_plus_coordinate(settings, scene)
+    if settings.origin_source == 'CAMERA_POSITION':
+        return Vector((0.0, 0.0, input_point.z))
+    return input_point
+
+def signed_angle_around_axis(from_vec, to_vec, axis):
+    axis = axis.normalized()
+    from_vec = (from_vec - axis * from_vec.dot(axis))
+    to_vec = (to_vec - axis * to_vec.dot(axis))
+    if from_vec.length <= 1.0e-8 or to_vec.length <= 1.0e-8:
+        return 0.0
+    from_vec.normalize()
+    to_vec.normalize()
+    return math.atan2(axis.dot(from_vec.cross(to_vec)), from_vec.dot(to_vec))
+
+def basis_from_normal_and_reference(normal, reference):
+    normal = normal.normalized()
+    tangent = reference - normal * reference.dot(normal)
+    if tangent.length <= 1.0e-8:
+        fallback = Vector((1.0, 0.0, 0.0))
+        if abs(fallback.dot(normal)) > 0.95:
+            fallback = Vector((0.0, 1.0, 0.0))
+        tangent = fallback - normal * fallback.dot(normal)
+    tangent.normalize()
+    bitangent = normal.cross(tangent).normalized()
+    return Matrix((tangent, bitangent, normal)).transposed()
+
+def get_floor_rotation_preserve_view(source_normal, target_normal, camera_matrix):
+    view_axis = camera_matrix.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+    source_basis = basis_from_normal_and_reference(source_normal, view_axis)
+    target_basis = basis_from_normal_and_reference(target_normal, view_axis)
+    return (target_basis @ source_basis.inverted()).to_quaternion()
+
+def get_orientation_plus_rotation(source_normal, target_normal, camera_matrix):
+    world_z = Vector((0.0, 0.0, 1.0))
+    target_normal = target_normal.normalized()
+    source_normal = source_normal.normalized()
+
+    if abs(target_normal.dot(world_z)) > 0.999:
+        if source_normal.dot(target_normal) > 0.999:
+            return Matrix.Identity(4).to_quaternion()
+        return get_floor_rotation_preserve_view(source_normal, target_normal, camera_matrix)
+
+    projected_source = Vector((source_normal.x, source_normal.y, 0.0))
+    if projected_source.length <= 1.0e-8:
+        return source_normal.rotation_difference(target_normal)
+
+    yaw = signed_angle_around_axis(projected_source, target_normal, world_z)
+    yaw_rotation = Matrix.Rotation(yaw, 4, world_z)
+    yawed_normal = (yaw_rotation.to_3x3() @ source_normal).normalized()
+    wall_axis = world_z.cross(target_normal)
+    if wall_axis.length <= 1.0e-8:
+        return yaw_rotation.to_quaternion()
+
+    tilt = signed_angle_around_axis(yawed_normal, target_normal, wall_axis)
+    tilt_rotation = Matrix.Rotation(tilt, 4, wall_axis.normalized())
+    return (tilt_rotation @ yaw_rotation).to_quaternion()
+
+def solve_two_point_plane_angle(points, target_normal, camera_matrix, prefer_camera_view=False):
+    world_z = Vector((0.0, 0.0, 1.0))
+    target_normal = target_normal.normalized()
+    camera_rotation = camera_matrix.to_quaternion()
+
+    if abs(target_normal.dot(world_z)) > 0.999:
+        axis = camera_rotation @ Vector((1.0, 0.0, 0.0))
+        view_axis = camera_rotation @ Vector((0.0, 0.0, -1.0))
+        point_delta = points[1] - points[0]
+        depth_delta = abs(point_delta.dot(view_axis.normalized()))
+        if depth_delta < max(1.0e-3, point_delta.length * 0.05):
+            if target_normal.z < 0.0:
+                return math.pi, axis, True
+            return 0.0, axis, True
+    else:
+        axis = world_z.copy()
+
+    if axis.length <= 1.0e-8:
+        return 0.0, axis, False
+
+    axis.normalize()
+    delta = points[1] - points[0]
+    a = target_normal.dot(delta)
+    b = target_normal.dot(axis.cross(delta))
+    c = target_normal.dot(axis) * axis.dot(delta)
+    p = a - c
+    radius = math.hypot(p, b)
+
+    if radius <= 1.0e-8:
+        return 0.0, axis, False
+
+    value = max(-1.0, min(1.0, -c / radius))
+    base = math.atan2(b, p)
+    option_a = base + math.acos(value)
+    option_b = base - math.acos(value)
+
+    def wrap_angle(angle):
+        return (angle + math.pi) % (math.tau) - math.pi
+
+    options = [wrap_angle(option_a), wrap_angle(option_b)]
+
+    def score_angle(angle):
+        pivot = camera_matrix.translation
+        rotation = Matrix.Translation(pivot) @ Matrix.Rotation(angle, 4, axis) @ Matrix.Translation(-pivot)
+        rotated_points = [rotation @ point for point in points]
+        if prefer_camera_view:
+            rotated_camera = rotation @ camera_matrix
+            view_axis = rotated_camera.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+            view_axis.z = 0.0
+            if view_axis.length <= 1.0e-8:
+                return (-2.0, -abs(angle))
+            view_axis.normalize()
+            return ((-view_axis).dot(target_normal), -abs(angle))
+        else:
+            center = reduce_points(rotated_points, 'MEAN')
+            normal = get_two_point_visible_normal(rotated_points, center, camera_matrix)
+            if not normal:
+                return (-2.0, -abs(angle))
+            return (normal.dot(target_normal), -abs(angle))
+
+    angle = max(options, key=score_angle)
+    return angle, axis, False
+
+def get_two_point_visible_normal(points, center, camera_matrix):
+    line = points[1] - points[0]
+    camera_ray = center - camera_matrix.translation
+    if line.length <= 1.0e-8 or camera_ray.length <= 1.0e-8:
+        return None
+    normal = line.cross(camera_ray)
+    if normal.length <= 1.0e-8:
+        return None
+    return orient_normal_toward_camera(normal, center, camera_matrix)
+
+def get_one_point_wall_rotation(target_normal, camera_matrix):
+    world_z = Vector((0.0, 0.0, 1.0))
+    target_normal = target_normal.normalized()
+    if abs(target_normal.dot(world_z)) > 0.999:
+        return Matrix.Identity(4).to_quaternion()
+
+    view_axis = camera_matrix.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+    projected_view = view_axis - world_z * view_axis.dot(world_z)
+    if projected_view.length <= 1.0e-8:
+        return Matrix.Identity(4).to_quaternion()
+
+    angle = signed_angle_around_axis(projected_view, -target_normal, world_z)
+    return Matrix.Rotation(angle, 4, world_z).to_quaternion()
+
+def get_one_point_floor_rotation(target_normal, camera_matrix):
+    world_z = Vector((0.0, 0.0, 1.0))
+    target_normal = target_normal.normalized()
+    if target_normal.z >= 0.0:
+        return Matrix.Identity(4).to_quaternion()
+
+    view_axis = camera_matrix.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+    flip_axis = view_axis - world_z * view_axis.dot(world_z)
+    if flip_axis.length <= 1.0e-8:
+        flip_axis = camera_matrix.to_quaternion() @ Vector((1.0, 0.0, 0.0))
+        flip_axis = flip_axis - world_z * flip_axis.dot(world_z)
+    if flip_axis.length <= 1.0e-8:
+        flip_axis = Vector((1.0, 0.0, 0.0))
+    return Matrix.Rotation(math.pi, 4, flip_axis.normalized()).to_quaternion()
 
 def create_projection_node_group(camera_obj):
     """
@@ -480,6 +843,196 @@ class PROJECTION_OT_setup_shader(bpy.types.Operator):
         else: selected_obj.data.materials.append(material)
         self.report({'INFO'}, f"Material '{material.name}' has been set up."); return {'FINISHED'}
 
+class CLIP_PG_orientation_plus_settings(bpy.types.PropertyGroup):
+    """Settings for Orientation Plus tools."""
+
+    contact_direction: bpy.props.EnumProperty(
+        name="Target Surface",
+        description="Floor or wall direction used for the contact plane",
+        items=(
+            ('Z_POS', "+Z Floor", "Use a floor plane with positive Z normal"),
+            ('Z_NEG', "-Z Floor", "Use a floor plane with negative Z normal"),
+            ('X_POS', "+X Wall", "Use a wall plane with positive X normal"),
+            ('X_NEG', "-X Wall", "Use a wall plane with negative X normal"),
+            ('Y_POS', "+Y Wall", "Use a wall plane with positive Y normal"),
+            ('Y_NEG', "-Y Wall", "Use a wall plane with negative Y normal"),
+        ),
+        default='Z_POS',
+    )
+
+    origin_source: bpy.props.EnumProperty(
+        name="Position Mode",
+        description="How the target plane position is determined",
+        items=(
+            ('INPUT', "Move Plane To", "Move the selected track plane center to the chosen coordinate"),
+            ('CAMERA_POSITION', "Keep Camera XY", "Keep the camera X/Y position and use only the chosen coordinate Z"),
+        ),
+        default='INPUT',
+    )
+
+    contact_origin: bpy.props.FloatVectorProperty(
+        name="Manual Coordinate",
+        description="Manual coordinate used as a point on the target plane",
+        subtype='XYZ',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+    )
+
+    coordinate_source: bpy.props.EnumProperty(
+        name="Coordinate",
+        description="Coordinate source used by the position mode",
+        items=(
+            ('ORIGIN', "None (Origin)", "Use the world origin"),
+            ('CURSOR', "3D Cursor", "Use the current scene 3D cursor location directly"),
+            ('MANUAL', "Manual", "Use the manual coordinate below"),
+        ),
+        default='ORIGIN',
+    )
+
+    aggregate_method: bpy.props.EnumProperty(
+        name="Track Center",
+        description="How selected reconstructed points are reduced to one representative point",
+        items=(
+            ('MEAN', "Average", "Use the average value of the selected points"),
+            ('MEDIAN', "Median", "Use the median value of the selected points"),
+        ),
+        default='MEAN',
+    )
+
+class CLIP_OT_orientation_plus_origin_from_cursor(Operator):
+    """Copies the 3D cursor location into Orientation Plus contact origin."""
+    bl_idname = "clip.orientation_plus_origin_from_cursor"
+    bl_label = "Origin From 3D Cursor"
+    bl_description = "Copies the scene 3D cursor location to the contact origin"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.clip_tools_orientation_plus
+        settings.contact_origin = context.scene.cursor.location
+        settings.coordinate_source = 'MANUAL'
+        self.report({'INFO'}, "3D cursor location copied to the manual coordinate.")
+        return {'FINISHED'}
+
+class CLIP_OT_orientation_plus_set_contact_plane(Operator):
+    """Moves solved camera/object positions so selected reconstructed points lie on a target plane."""
+    bl_idname = "clip.orientation_plus_set_contact_plane"
+    bl_label = "Align Contact Plane"
+    bl_description = "Fits selected reconstructed points onto the target floor or wall plane"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if not is_clip_editor_with_active_clip(context):
+            cls.poll_message_set("Requires an active clip in the Movie Clip Editor.")
+            return False
+        if not context.scene.camera:
+            cls.poll_message_set("Requires an active scene camera.")
+            return False
+        return True
+
+    def execute(self, context):
+        clip = context.space_data.clip
+        tracking_object = clip.tracking.objects.active
+        if not tracking_object:
+            self.report({'ERROR'}, "No active tracking object found.")
+            return {'CANCELLED'}
+
+        camera = get_camera_with_movieclip(context, clip)
+        if not camera:
+            self.report({'ERROR'}, "No camera using the active movie clip was found.")
+            return {'CANCELLED'}
+
+        orientation_object = get_orientation_plus_object(context, clip, tracking_object)
+        if not orientation_object:
+            self.report({'ERROR'}, "No object to apply orientation on.")
+            return {'CANCELLED'}
+
+        current_points, current_camera_matrix, current_orientation_matrix = get_evaluated_reconstructed_points(
+            context, clip, tracking_object, camera, orientation_object
+        )
+        if current_points is None:
+            self.report({'ERROR'}, "No solved camera reconstruction was found for the current frame.")
+            return {'CANCELLED'}
+        if len(current_points) < 1:
+            self.report({'ERROR'}, "Select at least 1 reconstructed track with 3D bundle data.")
+            return {'CANCELLED'}
+
+        settings = context.scene.clip_tools_orientation_plus
+        target_normal = get_orientation_plus_axis(settings, camera)
+        target_point = get_orientation_plus_target_point(settings, context.scene, current_camera_matrix)
+        current_source_point = reduce_points(current_points, settings.aggregate_method)
+
+        if len(current_points) == 1:
+            if settings.contact_direction.startswith('Z'):
+                rotation = get_one_point_floor_rotation(target_normal, current_camera_matrix)
+            else:
+                rotation = get_one_point_wall_rotation(target_normal, current_camera_matrix)
+        elif len(current_points) == 2:
+            angle, axis, used_depth_fallback = solve_two_point_plane_angle(
+                current_points,
+                target_normal,
+                current_camera_matrix,
+                prefer_camera_view=not settings.contact_direction.startswith('Z'),
+            )
+            if axis.length <= 1.0e-8:
+                self.report({'ERROR'}, "The selected 2 tracks cannot define a stable constrained rotation.")
+                return {'CANCELLED'}
+            rotation = Matrix.Rotation(angle, 4, axis.normalized()).to_quaternion()
+            if used_depth_fallback:
+                self.report({'WARNING'}, "2 selected tracks have too little depth; rotation correction was limited.")
+        else:
+            source_normal = fit_plane_normal(current_points, current_source_point)
+            if not source_normal:
+                self.report({'ERROR'}, "Selected reconstructed tracks are collinear; a plane cannot be fitted.")
+                return {'CANCELLED'}
+            source_normal = orient_normal_toward_camera(source_normal, current_source_point, current_camera_matrix)
+            rotation = get_orientation_plus_rotation(source_normal, target_normal, current_camera_matrix)
+
+        pivot = current_camera_matrix.translation.copy()
+        rotation_transform = (
+            Matrix.Translation(pivot) @
+            rotation.to_matrix().to_4x4() @
+            Matrix.Translation(-pivot)
+        )
+        rotated_source_point = rotation_transform @ current_source_point
+
+        if settings.origin_source == 'INPUT':
+            delta = target_point - rotated_source_point
+        else:
+            delta = Vector((0.0, 0.0, target_point.z - rotated_source_point.z))
+
+        transform = Matrix.Translation(delta) @ rotation_transform
+        rotation_angle = math.degrees(rotation.angle)
+
+        if delta.length < 1.0e-8 and rotation.angle < 1.0e-8:
+            self.report({'INFO'}, "Selected tracker plane is already aligned to the target plane.")
+            return {'FINISHED'}
+
+        transform_orientation_object(orientation_object, transform, current_orientation_matrix)
+        context.view_layer.update()
+
+        final_points, final_camera_matrix, _final_orientation_matrix = get_evaluated_reconstructed_points(
+            context, clip, tracking_object, camera, orientation_object
+        )
+        if final_points is None:
+            self.report({'ERROR'}, "No solved camera reconstruction was found after applying the transform.")
+            return {'CANCELLED'}
+        if settings.origin_source == 'INPUT':
+            final_point = reduce_points(final_points, settings.aggregate_method)
+            correction_delta = target_point - final_point
+        else:
+            final_track_point = reduce_points(final_points, settings.aggregate_method)
+            correction_delta = Vector((0.0, 0.0, target_point.z - final_track_point.z))
+
+        if correction_delta.length > 1.0e-8:
+            translate_orientation_object_world(orientation_object, correction_delta)
+
+        clip.update_tag()
+        orientation_object.update_tag(refresh={'OBJECT'})
+        context.view_layer.update()
+        self.report({'INFO'}, f"Set tracker plane on '{orientation_object.name}'. Move {tuple(round(v, 4) for v in delta)}, rotation {rotation_angle:.3f} deg.")
+        return {'FINISHED'}
+
 # --- UI Panels ---
 class CLIP_PT_tools_scenesetup(Panel):
     """UI Panel for general scene setup tools related to tracking."""
@@ -503,6 +1056,41 @@ class CLIP_PT_tools_scenesetup(Panel):
         col.operator(CLIP_OT_setup_camera_solver.bl_idname, icon='CON_CAMERASOLVER')
         col.operator(CLIP_OT_setup_object_solver.bl_idname, icon='CON_OBJECTSOLVER')
 
+class CLIP_PT_tools_orientation_plus(Panel):
+    """UI Panel for contact-only orientation helpers."""
+    bl_space_type = 'CLIP_EDITOR'
+    bl_region_type = 'TOOLS'
+    bl_label = "Orientation Plus"
+    bl_category = "Solve"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        sc = context.space_data
+        return sc and sc.clip and sc.view == 'CLIP' and sc.mode == 'TRACKING'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        settings = context.scene.clip_tools_orientation_plus
+
+        col = layout.column()
+        col.prop(settings, "contact_direction")
+        col.prop(settings, "origin_source")
+        col.prop(settings, "coordinate_source")
+        col.prop(settings, "aggregate_method")
+
+        if settings.coordinate_source == 'MANUAL':
+            col.separator()
+            coord_col = col.column(align=True)
+            coord_col.prop(settings, "contact_origin")
+            col.operator(CLIP_OT_orientation_plus_origin_from_cursor.bl_idname, icon='PIVOT_CURSOR')
+
+        col.separator()
+        col.operator(CLIP_OT_orientation_plus_set_contact_plane.bl_idname, text="Align Contact Plane", icon='SNAP_FACE')
+
 # --- UI and Registration ---
 def draw_button_for_3d_markers_to_empty_panel(self, context): self.layout.operator(CLIP_OT_3d_markers_to_empty.bl_idname, icon='EMPTY_AXIS')
 def draw_menu_item_for_3d_markers_to_empty(self, context): self.layout.separator(); self.layout.operator(CLIP_OT_3d_markers_to_empty.bl_idname, icon='EMPTY_AXIS')
@@ -516,6 +1104,7 @@ def draw_button_for_set_cam_projection_panel(self, context): self.layout.operato
 def draw_menu_item_for_set_cam_projection(self, context): self.layout.separator(); self.layout.operator(PROJECTION_OT_setup_shader.bl_idname, icon='MATERIAL')
 
 classes_to_register = (
+    CLIP_PG_orientation_plus_settings,
     CLIP_OT_setup_camera_solver,
     CLIP_OT_setup_object_solver,
     CLIP_OT_3d_markers_to_empty, 
@@ -523,8 +1112,11 @@ classes_to_register = (
     CLIP_OT_duplicate_active_movieclip,
     CLIP_OT_delete_active_movieclip, 
     CLIP_OT_create_image_plane_from_clip, 
+    CLIP_OT_orientation_plus_origin_from_cursor,
+    CLIP_OT_orientation_plus_set_contact_plane,
     PROJECTION_OT_setup_shader,
     CLIP_PT_tools_scenesetup,
+    CLIP_PT_tools_orientation_plus,
 )
 
 ui_additions = [
@@ -543,6 +1135,7 @@ ui_additions = [
 def register():
     """Registers all addon classes and appends UI elements."""
     for cls in classes_to_register: bpy.utils.register_class(cls)
+    bpy.types.Scene.clip_tools_orientation_plus = bpy.props.PointerProperty(type=CLIP_PG_orientation_plus_settings)
     for target_classname, draw_func in ui_additions:
         try:
             target_class = getattr(bpy.types, target_classname, None)
@@ -551,6 +1144,8 @@ def register():
 
 def unregister():
     """Unregisters all addon classes and removes UI elements."""
+    if hasattr(bpy.types.Scene, "clip_tools_orientation_plus"):
+        del bpy.types.Scene.clip_tools_orientation_plus
     for target_classname, draw_func in ui_additions:
         try:
             target_class = getattr(bpy.types, target_classname, None)
