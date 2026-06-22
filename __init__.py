@@ -6,10 +6,14 @@
 
 
 import bpy
+import importlib
 import re
 import math
 from mathutils import Matrix, Vector
 from bpy.types import Operator, Panel
+from . import track_tools
+
+importlib.reload(track_tools)
 
 # --- Helper Functions ---
 
@@ -90,6 +94,11 @@ def get_selected_reconstructed_points(context, camera=None):
         if track.select and track.has_bundle
     ]
 
+def get_orientation_object_base_world_matrix(obj):
+    if obj.parent:
+        return obj.parent.matrix_world @ obj.matrix_basis
+    return obj.matrix_basis.copy()
+
 def get_evaluated_reconstructed_points(context, clip, tracking_object, camera, orientation_object, frame=None):
     """Gets selected reconstructed points using solved object matrices at the requested frame."""
     scene = context.scene
@@ -101,7 +110,7 @@ def get_evaluated_reconstructed_points(context, clip, tracking_object, camera, o
         context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
         camera_matrix = camera.evaluated_get(depsgraph).matrix_world.copy()
-        orientation_matrix = orientation_object.evaluated_get(depsgraph).matrix_world.copy()
+        orientation_matrix = get_orientation_object_base_world_matrix(orientation_object)
         reconstruction = tracking_object.reconstruction
         reconstructed_matrix = None
         if reconstruction and reconstruction.is_valid:
@@ -867,7 +876,7 @@ class CLIP_PG_orientation_plus_settings(bpy.types.PropertyGroup):
             ('INPUT', "Move Plane To", "Move the selected track plane center to the chosen coordinate"),
             ('CAMERA_POSITION', "Keep Camera XY", "Keep the camera X/Y position and use only the chosen coordinate Z"),
         ),
-        default='INPUT',
+        default='CAMERA_POSITION',
     )
 
     contact_origin: bpy.props.FloatVectorProperty(
@@ -1134,6 +1143,7 @@ ui_additions = [
 
 def register():
     """Registers all addon classes and appends UI elements."""
+    track_tools.register()
     for cls in classes_to_register: bpy.utils.register_class(cls)
     bpy.types.Scene.clip_tools_orientation_plus = bpy.props.PointerProperty(type=CLIP_PG_orientation_plus_settings)
     for target_classname, draw_func in ui_additions:
@@ -1152,3 +1162,4 @@ def unregister():
             if target_class and hasattr(target_class, "remove"): target_class.remove(draw_func)
         except (AttributeError, RuntimeError): pass
     for cls in reversed(classes_to_register): bpy.utils.unregister_class(cls)
+    track_tools.unregister()
