@@ -51,6 +51,11 @@
 
 ---
 
+### Track Jump  
+**Location:** `Toolbar > Track Tab > Track > Jump`or `Graph/Dopesheet Header`  
+- Jumps through the selected track’s marker frames. Use the inner buttons to move to the previous or next keyed marker frame. Use the outer buttons to move through the start and end of each enabled tracking range, including separated tracking islands.
+---
+
 ### 3D Markers to Empty
 **Location:** `Toolbar > Solve Tab > Geometry` or `Header > Reconstruction Menus`
 
