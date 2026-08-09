@@ -43,6 +43,82 @@ def get_active_tracks(context):
     return []
 
 
+def get_selected_navigation_tracks(context):
+    tracks = get_active_tracks(context)
+    if not tracks:
+        return []
+
+    selected_tracks = [track for track in tracks if is_track_selected(track)]
+    active_track = getattr(tracks, "active", None)
+    if active_track and active_track in selected_tracks:
+        return [active_track]
+    if active_track and not selected_tracks:
+        return [active_track]
+
+    return selected_tracks
+
+
+def scene_to_marker_frame(clip, scene_frame):
+    return int(round(scene_frame - clip.frame_start + 1 + clip.frame_offset))
+
+
+def marker_to_scene_frame(clip, marker_frame):
+    return int(round(marker_frame + clip.frame_start - 1 - clip.frame_offset))
+
+
+def redraw_clip_editors(context):
+    if not context:
+        return
+
+    context.view_layer.update()
+    screen = getattr(context, "screen", None)
+    if not screen:
+        return
+
+    for area in screen.areas:
+        if area.type == 'CLIP_EDITOR':
+            area.tag_redraw()
+
+
+def change_clip_editor_frame(context, clip, scene_frame):
+    screen = getattr(context, "screen", None)
+    if not screen:
+        return False
+
+    changed = False
+    for area in screen.areas:
+        if area.type != 'CLIP_EDITOR':
+            continue
+
+        for space in area.spaces:
+            if space.type != 'CLIP_EDITOR' or space.clip != clip:
+                continue
+
+            region = next((region for region in area.regions if region.type == 'WINDOW'), None)
+            override = {"area": area, "space_data": space}
+            if region:
+                override["region"] = region
+
+            try:
+                with context.temp_override(**override):
+                    bpy.ops.clip.change_frame(frame=scene_frame)
+                changed = True
+            except RuntimeError:
+                pass
+
+    return changed
+
+
+def set_current_marker_frame(context, marker_frame):
+    clip = get_clip(context)
+    scene_frame = marker_to_scene_frame(clip, marker_frame) if clip else marker_frame
+    context.scene.frame_set(scene_frame)
+    if clip:
+        clip.update_tag()
+        change_clip_editor_frame(context, clip, scene_frame)
+    redraw_clip_editors(context)
+
+
 def clear_clip_solution(context):
     if not get_clip(context):
         return False
@@ -623,6 +699,48 @@ def is_track_selected(track):
     )
 
 
+def find_neighbor_frame(frames, current_frame, direction):
+    frames = sorted(set(int(frame) for frame in frames))
+    if direction == 'PREVIOUS':
+        previous_frames = [frame for frame in frames if frame < current_frame]
+        return previous_frames[-1] if previous_frames else None
+
+    next_frames = [frame for frame in frames if frame > current_frame]
+    return next_frames[0] if next_frames else None
+
+
+def get_track_key_frames(track):
+    markers = sorted(track.markers, key=lambda marker: marker.frame)
+    keyed_frames = [
+        marker.frame
+        for marker in markers
+        if bool(getattr(marker, "is_keyed", False))
+    ]
+    if keyed_frames:
+        return keyed_frames
+
+    return [marker.frame for marker in markers]
+
+
+def get_selected_key_frames(context):
+    frames = []
+    for track in get_selected_navigation_tracks(context):
+        frames.extend(get_track_key_frames(track))
+
+    return frames
+
+
+def get_selected_enabled_range_frames(context):
+    frames = []
+    for track in get_selected_navigation_tracks(context):
+        markers = sorted(track.markers, key=lambda marker: marker.frame)
+        for island in get_enabled_islands(markers):
+            frames.append(island[0].frame)
+            frames.append(island[-1].frame)
+
+    return frames
+
+
 def track_label(track):
     return getattr(track, "name", "Track")
 
@@ -804,6 +922,106 @@ class CLIP_OT_marker_offset_get_source(Operator):
         return {'FINISHED'}
 
 
+def jump_selected_track_frames(context, direction, frame_getter, boundary_message, report):
+    if not get_selected_navigation_tracks(context):
+        report({'ERROR'}, "Select a track in the active tracking object.")
+        return {'CANCELLED'}
+
+    clip = get_clip(context)
+    current_marker_frame = scene_to_marker_frame(clip, context.scene.frame_current)
+    target_frame = find_neighbor_frame(
+        frame_getter(context),
+        current_marker_frame,
+        direction,
+    )
+    if target_frame is None:
+        report({'INFO'}, boundary_message)
+        return {'CANCELLED'}
+
+    set_current_marker_frame(context, target_frame)
+    return {'FINISHED'}
+
+
+class CLIP_OT_jump_selected_track_key_previous(Operator):
+    bl_idname = "clip.jump_selected_track_key_previous"
+    bl_label = "Previous Track Key"
+    bl_description = "Jump to the previous keyed marker frame on the selected track"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return get_clip(context) is not None
+
+    def execute(self, context):
+        return jump_selected_track_frames(
+            context,
+            'PREVIOUS',
+            get_selected_key_frames,
+            "No keyed marker frame found before the current frame.",
+            self.report,
+        )
+
+
+class CLIP_OT_jump_selected_track_key_next(Operator):
+    bl_idname = "clip.jump_selected_track_key_next"
+    bl_label = "Next Track Key"
+    bl_description = "Jump to the next keyed marker frame on the selected track"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return get_clip(context) is not None
+
+    def execute(self, context):
+        return jump_selected_track_frames(
+            context,
+            'NEXT',
+            get_selected_key_frames,
+            "No keyed marker frame found after the current frame.",
+            self.report,
+        )
+
+
+class CLIP_OT_jump_selected_track_range_previous(Operator):
+    bl_idname = "clip.jump_selected_track_range_previous"
+    bl_label = "Previous Track Range"
+    bl_description = "Jump to the previous enabled tracking range boundary on the selected track"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return get_clip(context) is not None
+
+    def execute(self, context):
+        return jump_selected_track_frames(
+            context,
+            'PREVIOUS',
+            get_selected_enabled_range_frames,
+            "No enabled tracking range boundary found before the current frame.",
+            self.report,
+        )
+
+
+class CLIP_OT_jump_selected_track_range_next(Operator):
+    bl_idname = "clip.jump_selected_track_range_next"
+    bl_label = "Next Track Range"
+    bl_description = "Jump to the next enabled tracking range boundary on the selected track"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return get_clip(context) is not None
+
+    def execute(self, context):
+        return jump_selected_track_frames(
+            context,
+            'NEXT',
+            get_selected_enabled_range_frames,
+            "No enabled tracking range boundary found after the current frame.",
+            self.report,
+        )
+
+
 class CLIP_OT_auto_interpolate_track_gap_with_islands(Operator):
     bl_idname = "clip.auto_interpolate_track_gap_with_islands"
     bl_label = "Track Bridge"
@@ -814,8 +1032,10 @@ class CLIP_OT_auto_interpolate_track_gap_with_islands(Operator):
             self.report({'ERROR'}, "Open a clip in the Movie Clip Editor.")
             return {'CANCELLED'}
 
+        clip = get_clip(context)
         settings = context.scene.track_gap_interp_settings
-        current_frame = context.scene.frame_current
+        current_scene_frame = context.scene.frame_current
+        current_frame = scene_to_marker_frame(clip, current_scene_frame)
         tracks = [track for track in get_active_tracks(context) if is_track_selected(track)]
         if not tracks:
             self.report({'ERROR'}, "Select at least one track in the active tracking object to interpolate.")
@@ -843,7 +1063,7 @@ class CLIP_OT_auto_interpolate_track_gap_with_islands(Operator):
 
         self.report(
             {'INFO'},
-            f"{first_result['method']}: Baked {total_markers} markers on {len(processed)} track(s) near frame {current_frame}.{solution_status}"
+            f"{first_result['method']}: Baked {total_markers} markers on {len(processed)} track(s) near frame {current_scene_frame}.{solution_status}"
         )
         return {'FINISHED'}
 
@@ -859,6 +1079,9 @@ class CLIP_OT_track_bridge_disable_range(Operator):
             return {'CANCELLED'}
 
         settings = context.scene.track_gap_interp_settings
+        clip = get_clip(context)
+        frame_start = scene_to_marker_frame(clip, settings.disable_range_start)
+        frame_end = scene_to_marker_frame(clip, settings.disable_range_end)
         tracks = [track for track in get_active_tracks(context) if is_track_selected(track)]
         if not tracks:
             self.report({'ERROR'}, "Select at least one track in the active tracking object.")
@@ -869,8 +1092,8 @@ class CLIP_OT_track_bridge_disable_range(Operator):
         for track in tracks:
             result, error = disable_track_markers_in_range(
                 track,
-                settings.disable_range_start,
-                settings.disable_range_end,
+                frame_start,
+                frame_end,
             )
             if result is None:
                 skipped.append(f"{track_label(track)}: {error}")
@@ -882,7 +1105,8 @@ class CLIP_OT_track_bridge_disable_range(Operator):
             return {'CANCELLED'}
 
         total = sum(result["count"] for _, result in processed)
-        first_result = processed[0][1]
+        scene_start = min(settings.disable_range_start, settings.disable_range_end)
+        scene_end = max(settings.disable_range_start, settings.disable_range_end)
         solution_status = " Solution cleared." if clear_clip_solution(context) else ""
 
         if skipped:
@@ -890,7 +1114,7 @@ class CLIP_OT_track_bridge_disable_range(Operator):
 
         self.report(
             {'INFO'},
-            f"Disabled {total} key(s) on {len(processed)} track(s), frames {first_result['frame_start']}-{first_result['frame_end']}.{solution_status}"
+            f"Disabled {total} key(s) on {len(processed)} track(s), frames {scene_start}-{scene_end}.{solution_status}"
         )
         return {'FINISHED'}
 
@@ -913,6 +1137,45 @@ class CLIP_OT_track_bridge_set_disable_range_end(Operator):
     def execute(self, context):
         context.scene.track_gap_interp_settings.disable_range_end = context.scene.frame_current
         return {'FINISHED'}
+
+
+def draw_track_jump_buttons(row):
+    row.operator(CLIP_OT_jump_selected_track_range_previous.bl_idname, text="", icon='TRIA_LEFT_BAR')
+    row.operator(CLIP_OT_jump_selected_track_key_previous.bl_idname, text="", icon='PREV_KEYFRAME')
+    row.operator(CLIP_OT_jump_selected_track_key_next.bl_idname, text="", icon='NEXT_KEYFRAME')
+    row.operator(CLIP_OT_jump_selected_track_range_next.bl_idname, text="", icon='TRIA_RIGHT_BAR')
+
+
+def draw_track_jump_button_row(layout):
+    previous_context = layout.operator_context
+    layout.operator_context = 'EXEC_DEFAULT'
+    try:
+        row = layout.row(align=True)
+        draw_track_jump_buttons(row)
+    finally:
+        layout.operator_context = previous_context
+
+
+def draw_track_jump_header(self, context):
+    space = context.space_data
+    if not space or space.type != 'CLIP_EDITOR' or space.view not in {'GRAPH', 'DOPESHEET'}:
+        return
+    if get_clip(context) is None:
+        return
+
+    draw_track_jump_button_row(self.layout)
+
+
+def draw_track_jump_tools_tracking(self, context):
+    if get_clip(context) is None:
+        return
+
+    row = self.layout.row(align=True)
+    row.label(text="Jump:")
+    previous_context = row.operator_context
+    row.operator_context = 'EXEC_DEFAULT'
+    draw_track_jump_buttons(row)
+    row.operator_context = previous_context
 
 
 class CLIP_PT_track_time_offset(Panel):
@@ -1005,6 +1268,10 @@ class CLIP_PT_track_bridge_disable_range(Panel):
 classes = (
     TrackGapInterpSettings,
     CLIP_OT_marker_offset_get_source,
+    CLIP_OT_jump_selected_track_key_previous,
+    CLIP_OT_jump_selected_track_key_next,
+    CLIP_OT_jump_selected_track_range_previous,
+    CLIP_OT_jump_selected_track_range_next,
     CLIP_OT_auto_interpolate_track_gap_with_islands,
     CLIP_OT_track_bridge_disable_range,
     CLIP_OT_track_bridge_set_disable_range_start,
@@ -1018,6 +1285,11 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    if hasattr(bpy.types, "CLIP_HT_header"):
+        bpy.types.CLIP_HT_header.append(draw_track_jump_header)
+    if hasattr(bpy.types, "CLIP_PT_tools_tracking"):
+        bpy.types.CLIP_PT_tools_tracking.append(draw_track_jump_tools_tracking)
 
     bpy.types.Scene.clip_tools_marker_offset = IntProperty(
         name="Frame Offset",
@@ -1044,6 +1316,17 @@ def unregister():
         del bpy.types.Scene.clip_tools_marker_offset_selected_only
     if hasattr(bpy.types.Scene, "clip_tools_marker_offset"):
         del bpy.types.Scene.clip_tools_marker_offset
+
+    if hasattr(bpy.types, "CLIP_HT_header"):
+        try:
+            bpy.types.CLIP_HT_header.remove(draw_track_jump_header)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+    if hasattr(bpy.types, "CLIP_PT_tools_tracking"):
+        try:
+            bpy.types.CLIP_PT_tools_tracking.remove(draw_track_jump_tools_tracking)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

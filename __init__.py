@@ -26,9 +26,24 @@ def get_frame_number_from_path(filepath):
     """Extracts the frame number sequence from the end of a filepath string."""
     if not filepath:
         return None
-    # This regex specifically looks for a number sequence right before the file extension.
-    match = re.search(r'(\d+)\.\w+$', filepath)
+
+    filename = re.split(r'[\\/]', filepath)[-1]
+    if not filename:
+        return None
+
+    # Ignore Blender data-block suffixes such as "plate_1001.jpg.001" when a
+    # file path is not available and a name must be used as fallback.
+    datablock_suffix = re.search(r'\.(\d{3})$', filename)
+    if datablock_suffix and re.search(r'\.[A-Za-z][A-Za-z0-9]*\.\d{3}$', filename):
+        filename = filename[:datablock_suffix.start()]
+    stem = re.sub(r'\.[^.]*$', '', filename)
+    match = re.search(r'(\d+)$', stem)
     return int(match.group(1)) if match else None
+
+def set_clip_scene_frames(jump_to_start=True):
+    bpy.ops.clip.set_scene_frames()
+    if jump_to_start:
+        bpy.ops.screen.frame_jump(end=False)
 
 def constraint_uses_clip(constraint, clip):
     if constraint.type not in {'CAMERA_SOLVER', 'OBJECT_SOLVER'}:
@@ -629,15 +644,33 @@ class CLIP_OT_set_start_frame_from_filename(bpy.types.Operator):
         return is_clip_editor_with_active_clip(context)
         
     def execute(self, context):
-        clip = context.space_data.clip; name_to_parse = clip.name
-        match = re.search(r'[._](\d+)\.\w+$', name_to_parse)
-        if match:
-            try: frame_start = int(match.group(1))
-            except ValueError: self.report({'ERROR'}, f"Could not convert matched pattern '{match.group(1)}' to an integer."); return {'CANCELLED'}
-            clip.frame_start = frame_start; bpy.ops.clip.set_scene_frames(); bpy.ops.screen.frame_jump(end=False)
-            self.report({'INFO'}, f"Clip '{clip.name}': start frame set to {frame_start}. Scene frames updated.")
+        clip = context.space_data.clip
+        source_path = clip.filepath or clip.name
+        frame_start = get_frame_number_from_path(source_path)
+        if frame_start is not None:
+            clip.frame_start = frame_start; set_clip_scene_frames()
+            self.report({'INFO'}, f"Clip '{clip.name}': start frame set to {frame_start} from '{source_path}'. Scene frames updated.")
         else:
-            self.report({'WARNING'}, f"No frame number pattern like '.####.' or '_####.' found in clip name: '{name_to_parse}'"); return {'CANCELLED'}
+            set_clip_scene_frames()
+            self.report({'INFO'}, f"No trailing frame number found in '{source_path}'. Scene frames updated without changing clip start.")
+        return {'FINISHED'}
+
+class CLIP_OT_reset_start_frame_and_scene_frames(bpy.types.Operator):
+    """Resets the active clip start frame to 1 and updates scene frames."""
+    bl_idname = "clip.reset_start_frame_and_scene_frames"
+    bl_label = "Reset Start Frame"
+    bl_description = "Reset clip start frame to 1 and run Set Scene Frames"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return is_clip_editor_with_active_clip(context)
+
+    def execute(self, context):
+        clip = context.space_data.clip
+        clip.frame_start = 1
+        set_clip_scene_frames()
+        self.report({'INFO'}, f"Clip '{clip.name}': start frame reset to 1. Scene frames updated.")
         return {'FINISHED'}
 
 class CLIP_OT_duplicate_active_movieclip(bpy.types.Operator):
@@ -1103,7 +1136,10 @@ class CLIP_PT_tools_orientation_plus(Panel):
 # --- UI and Registration ---
 def draw_button_for_3d_markers_to_empty_panel(self, context): self.layout.operator(CLIP_OT_3d_markers_to_empty.bl_idname, icon='EMPTY_AXIS')
 def draw_menu_item_for_3d_markers_to_empty(self, context): self.layout.separator(); self.layout.operator(CLIP_OT_3d_markers_to_empty.bl_idname, icon='EMPTY_AXIS')
-def draw_button_for_set_start_frame_panel(self, context): self.layout.operator(CLIP_OT_set_start_frame_from_filename.bl_idname)
+def draw_button_for_set_start_frame_panel(self, context):
+    row = self.layout.row(align=True)
+    row.operator(CLIP_OT_reset_start_frame_and_scene_frames.bl_idname, text="", icon='LOOP_BACK')
+    row.operator(CLIP_OT_set_start_frame_from_filename.bl_idname)
 def draw_menu_item_for_setup_solvers(self, context): self.layout.operator(CLIP_OT_setup_camera_solver.bl_idname, icon='CON_CAMERASOLVER'); self.layout.operator(CLIP_OT_setup_object_solver.bl_idname, icon='CON_OBJECTSOLVER'); self.layout.separator()
 def draw_menu_item_for_duplicate_clip(self, context): self.layout.operator(CLIP_OT_duplicate_active_movieclip.bl_idname, icon='DUPLICATE')
 def draw_menu_item_for_delete_clip(self, context): self.layout.operator(CLIP_OT_delete_active_movieclip.bl_idname, icon='TRASH')
@@ -1118,6 +1154,7 @@ classes_to_register = (
     CLIP_OT_setup_object_solver,
     CLIP_OT_3d_markers_to_empty, 
     CLIP_OT_set_start_frame_from_filename, 
+    CLIP_OT_reset_start_frame_and_scene_frames,
     CLIP_OT_duplicate_active_movieclip,
     CLIP_OT_delete_active_movieclip, 
     CLIP_OT_create_image_plane_from_clip, 
