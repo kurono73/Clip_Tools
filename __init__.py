@@ -12,8 +12,14 @@ import math
 from mathutils import Matrix, Vector
 from bpy.types import Operator, Panel
 from . import track_tools
+from . import plane_track_tools
+from . import track_bridge_preview
+from . import mask_tools
 
 importlib.reload(track_tools)
+importlib.reload(plane_track_tools)
+importlib.reload(track_bridge_preview)
+importlib.reload(mask_tools)
 
 # --- Helper Functions ---
 
@@ -636,7 +642,7 @@ class CLIP_OT_set_start_frame_from_filename(bpy.types.Operator):
     """Sets the clip's start frame from a number in its filename."""
     bl_idname = "clip.set_start_frame_from_filename"
     bl_label = "Set Start Seq No."
-    bl_description = "Sets clip start frame from a number in its name (e.g., 'clip.####.ext' or 'clip_####.ext')"
+    bl_description = "Set sequence start from its source filename, or run Set Scene Frames for movies"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -645,6 +651,10 @@ class CLIP_OT_set_start_frame_from_filename(bpy.types.Operator):
         
     def execute(self, context):
         clip = context.space_data.clip
+        if clip.source == 'MOVIE':
+            set_clip_scene_frames()
+            self.report({'INFO'}, "Scene frames updated from the movie clip.")
+            return {'FINISHED'}
         source_path = clip.filepath or clip.name
         frame_start = get_frame_number_from_path(source_path)
         if frame_start is not None:
@@ -1181,6 +1191,8 @@ ui_additions = [
 def register():
     """Registers all addon classes and appends UI elements."""
     track_tools.register()
+    plane_track_tools.register()
+    mask_tools.register()
     for cls in classes_to_register: bpy.utils.register_class(cls)
     bpy.types.Scene.clip_tools_orientation_plus = bpy.props.PointerProperty(type=CLIP_PG_orientation_plus_settings)
     for target_classname, draw_func in ui_additions:
@@ -1200,3 +1212,5 @@ def unregister():
         except (AttributeError, RuntimeError): pass
     for cls in reversed(classes_to_register): bpy.utils.unregister_class(cls)
     track_tools.unregister()
+    plane_track_tools.unregister()
+    mask_tools.unregister()

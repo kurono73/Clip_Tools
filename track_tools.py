@@ -1,3 +1,6 @@
+from bisect import bisect_left, insort
+from math import isfinite
+
 import bpy
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
@@ -355,7 +358,17 @@ def on_marker_offset_changed(scene, context):
     set_marker_offset_status(context, message)
 
 
+def on_bridge_preview_changed(settings, context):
+    from . import track_bridge_preview
+    track_bridge_preview.set_enabled(context, settings.preview_enabled)
+
+
 class TrackGapInterpSettings(PropertyGroup):
+    preview_enabled: BoolProperty(
+        name="Preview", default=False, options={'SKIP_SAVE'},
+        description="Overlay the interpolated path without changing any markers",
+        update=on_bridge_preview_changed,
+    )
     interpolation_method: EnumProperty(
         name="Method",
         items=[
@@ -817,7 +830,7 @@ def get_bridge_bake_frames(track, selected_islands):
     return frames
 
 
-def interpolate_track_gap(track, current_frame, settings):
+def plan_track_gap(track, current_frame, settings):
     markers = sorted(track.markers, key=lambda m: m.frame)
     if len(markers) < 2:
         return None, "Not enough markers."
@@ -855,11 +868,45 @@ def interpolate_track_gap(track, current_frame, settings):
     if len(control_points) < 2:
         return None, "Not enough reference control points."
 
-    method = settings.interpolation_method
-    count = 0
+    positions = []
     for frame in bake_frames:
-        co = interpolate_between_points(control_points, frame, method, settings.tangent_strength)
-        parameter_data = previous_marker_parameters(markers, frame)
+        co = interpolate_between_points(control_points, frame, settings.interpolation_method, settings.tangent_strength)
+        if not all(isfinite(value) for value in co):
+            return None, "Interpolation produced an invalid position."
+        positions.append((frame, tuple(co)))
+    positions_by_frame = dict(positions)
+    paths = []
+    for left, right in zip(selected_islands, selected_islands[1:]):
+        path = [(left[-1].frame, tuple(left[-1].co))]
+        path.extend((frame, positions_by_frame[frame])
+                    for frame in range(left[-1].frame + 1, right[0].frame)
+                    if frame in positions_by_frame)
+        path.append((right[0].frame, tuple(right[0].co)))
+        paths.append(tuple(path))
+    existing_paths = []
+    context_count = max(2, outer_count)
+    for index, island in enumerate(selected_islands):
+        visible = island[-context_count:] if index == 0 else island
+        if index == len(selected_islands) - 1:
+            visible = visible[:context_count]
+        existing_paths.append(tuple((marker.frame, tuple(marker.co)) for marker in visible))
+    return {"count": len(positions), "bake_start": bake_start, "bake_end": bake_end,
+            "method": settings.interpolation_method, "positions": tuple(positions),
+            "paths": tuple(paths), "existing_paths": tuple(existing_paths)}, None
+
+
+def interpolate_track_gap(track, current_frame, settings):
+    plan, error = plan_track_gap(track, current_frame, settings)
+    if plan is None:
+        return None, error
+    # Detach marker parameters before insert/delete can invalidate RNA pointers.
+    parameters = [(marker.frame, marker_parameter_data(marker)) for marker in track.markers]
+    parameters.sort(key=lambda item: item[0])
+    parameter_frames = [frame for frame, _data in parameters]
+    parameters_by_frame = dict(parameters)
+    for frame, co in plan["positions"]:
+        index = max(0, bisect_left(parameter_frames, frame) - 1)
+        parameter_data = parameters_by_frame[parameter_frames[index]]
         existing = track.markers.find_frame(frame, exact=True)
         if existing is not None:
             track.markers.delete_frame(frame)
@@ -868,9 +915,10 @@ def interpolate_track_gap(track, current_frame, settings):
         if parameter_data:
             apply_marker_parameters(marker, parameter_data)
         marker.mute = False
-        count += 1
-
-    return {"count": count, "bake_start": bake_start, "bake_end": bake_end, "method": method}, None
+        if frame not in parameters_by_frame:
+            insort(parameter_frames, frame)
+        parameters_by_frame[frame] = marker_parameter_data(marker)
+    return {key: plan[key] for key in ("count", "bake_start", "bake_end", "method")}, None
 
 
 def disable_track_markers_in_range(track, frame_start, frame_end):
@@ -942,50 +990,77 @@ def jump_selected_track_frames(context, direction, frame_getter, boundary_messag
     return {'FINISHED'}
 
 
+def jump_selected_track_key(context, direction, report):
+    if context.space_data.mode == 'MASK':
+        from .mask_tools import jump_mask_key
+        return jump_mask_key(context, direction, report)
+    # Imported at execution time because plane tools use the common clip helpers.
+    from .plane_track_tools import get_active_plane_track, jump_plane_key
+
+    plane = get_active_plane_track(context)
+    if plane is not None and (plane.select or getattr(context, "clip_tools_key_plane", None) == plane):
+        return jump_plane_key(context, direction, report)
+    boundary = ("No keyed marker frame found before the current frame."
+                if direction == 'PREVIOUS' else "No keyed marker frame found after the current frame.")
+    return jump_selected_track_frames(context, direction, get_selected_key_frames, boundary, report)
+
+
+def track_key_jump_poll(cls, context):
+    if getattr(context.space_data, "mode", None) == 'MASK':
+        from .mask_tools import mask_tools_poll
+        return mask_tools_poll(cls, context)
+    if getattr(context, "clip_tools_key_plane", None) is not None:
+        from .plane_track_tools import plane_track_poll
+        return plane_track_poll(cls, context)
+    return get_clip(context) is not None
+
+
 class CLIP_OT_jump_selected_track_key_previous(Operator):
     bl_idname = "clip.jump_selected_track_key_previous"
     bl_label = "Previous Track Key"
-    bl_description = "Jump to the previous keyed marker frame on the selected track"
+    bl_description = "Jump to the previous keyframe on selected point/plane tracks or mask layers"
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
-        return get_clip(context) is not None
+        return track_key_jump_poll(cls, context)
 
     def execute(self, context):
-        return jump_selected_track_frames(
-            context,
-            'PREVIOUS',
-            get_selected_key_frames,
-            "No keyed marker frame found before the current frame.",
-            self.report,
-        )
+        return jump_selected_track_key(context, 'PREVIOUS', self.report)
 
 
 class CLIP_OT_jump_selected_track_key_next(Operator):
     bl_idname = "clip.jump_selected_track_key_next"
     bl_label = "Next Track Key"
-    bl_description = "Jump to the next keyed marker frame on the selected track"
+    bl_description = "Jump to the next keyframe on selected point/plane tracks or mask layers"
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
-        return get_clip(context) is not None
+        return track_key_jump_poll(cls, context)
 
     def execute(self, context):
-        return jump_selected_track_frames(
-            context,
-            'NEXT',
-            get_selected_key_frames,
-            "No keyed marker frame found after the current frame.",
-            self.report,
-        )
+        return jump_selected_track_key(context, 'NEXT', self.report)
+
+
+def jump_selected_track_range(context, direction, report):
+    from .plane_track_tools import get_active_plane_track, jump_plane_range
+
+    plane = get_active_plane_track(context)
+    if plane is not None and plane.select:
+        return jump_plane_range(context, direction, report)
+    if not get_selected_navigation_tracks(context):
+        report({'INFO'}, "Select a point or plane track in the active tracking object.")
+        return {'CANCELLED'}
+    boundary = ("No enabled tracking range boundary found before the current frame."
+                if direction == 'PREVIOUS' else "No enabled tracking range boundary found after the current frame.")
+    return jump_selected_track_frames(context, direction, get_selected_enabled_range_frames, boundary, report)
 
 
 class CLIP_OT_jump_selected_track_range_previous(Operator):
     bl_idname = "clip.jump_selected_track_range_previous"
     bl_label = "Previous Track Range"
-    bl_description = "Jump to the previous enabled tracking range boundary on the selected track"
+    bl_description = "Jump to the previous enabled range boundary on the selected point or plane track"
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -993,19 +1068,13 @@ class CLIP_OT_jump_selected_track_range_previous(Operator):
         return get_clip(context) is not None
 
     def execute(self, context):
-        return jump_selected_track_frames(
-            context,
-            'PREVIOUS',
-            get_selected_enabled_range_frames,
-            "No enabled tracking range boundary found before the current frame.",
-            self.report,
-        )
+        return jump_selected_track_range(context, 'PREVIOUS', self.report)
 
 
 class CLIP_OT_jump_selected_track_range_next(Operator):
     bl_idname = "clip.jump_selected_track_range_next"
     bl_label = "Next Track Range"
-    bl_description = "Jump to the next enabled tracking range boundary on the selected track"
+    bl_description = "Jump to the next enabled range boundary on the selected point or plane track"
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -1013,13 +1082,7 @@ class CLIP_OT_jump_selected_track_range_next(Operator):
         return get_clip(context) is not None
 
     def execute(self, context):
-        return jump_selected_track_frames(
-            context,
-            'NEXT',
-            get_selected_enabled_range_frames,
-            "No enabled tracking range boundary found after the current frame.",
-            self.report,
-        )
+        return jump_selected_track_range(context, 'NEXT', self.report)
 
 
 class CLIP_OT_auto_interpolate_track_gap_with_islands(Operator):
@@ -1054,6 +1117,8 @@ class CLIP_OT_auto_interpolate_track_gap_with_islands(Operator):
             self.report({'ERROR'}, skipped[0] if skipped else "No tracks processed.")
             return {'CANCELLED'}
 
+        if settings.preview_enabled:
+            settings.preview_enabled = False
         total_markers = sum(result["count"] for _, result in processed)
         first_result = processed[0][1]
         solution_status = " Solution cleared." if clear_clip_solution(context) else ""
@@ -1146,9 +1211,14 @@ def draw_track_jump_buttons(row):
     row.operator(CLIP_OT_jump_selected_track_range_next.bl_idname, text="", icon='TRIA_RIGHT_BAR')
 
 
-def draw_track_jump_button_row(layout):
+def key_navigation_context(context):
+    return ('EXEC_REGION_PREVIEW' if context.space_data.view in {'GRAPH', 'DOPESHEET'}
+            else 'EXEC_REGION_WIN')
+
+
+def draw_track_jump_button_row(layout, context):
     previous_context = layout.operator_context
-    layout.operator_context = 'EXEC_DEFAULT'
+    layout.operator_context = key_navigation_context(context)
     try:
         row = layout.row(align=True)
         draw_track_jump_buttons(row)
@@ -1163,7 +1233,7 @@ def draw_track_jump_header(self, context):
     if get_clip(context) is None:
         return
 
-    draw_track_jump_button_row(self.layout)
+    draw_track_jump_button_row(self.layout, context)
 
 
 def draw_track_jump_tools_tracking(self, context):
@@ -1173,7 +1243,7 @@ def draw_track_jump_tools_tracking(self, context):
     row = self.layout.row(align=True)
     row.label(text="Jump:")
     previous_context = row.operator_context
-    row.operator_context = 'EXEC_DEFAULT'
+    row.operator_context = key_navigation_context(context)
     draw_track_jump_buttons(row)
     row.operator_context = previous_context
 
@@ -1240,6 +1310,12 @@ class CLIP_PT_auto_interpolate_track_gap_with_islands(Panel):
         tangent_col = row.row(align=True)
         tangent_col.enabled = settings.interpolation_method in {'CATMULL_ROM', 'AKIMA'}
         tangent_col.prop(settings, "tangent_strength")
+        col.prop(settings, "preview_enabled", toggle=True, icon='HIDE_OFF')
+        if settings.preview_enabled:
+            from . import track_bridge_preview
+            status = track_bridge_preview.status_for_context(context)
+            if status:
+                col.label(text=status, icon='INFO')
         col.operator(CLIP_OT_auto_interpolate_track_gap_with_islands.bl_idname, text="Bridge Gap")
 
 
@@ -1263,6 +1339,49 @@ class CLIP_PT_track_bridge_disable_range(Panel):
         row.prop(settings, "disable_range_end", text="Out")
         row.operator(CLIP_OT_track_bridge_set_disable_range_end.bl_idname, text="", icon='TRIA_RIGHT_BAR')
         col.operator(CLIP_OT_track_bridge_disable_range.bl_idname, text="Clear Track Range")
+
+
+_LEGACY_KEY_JUMPS = {
+    "clip.plane_track_key_previous": "clip.jump_selected_track_key_previous",
+    "clip.plane_track_key_next": "clip.jump_selected_track_key_next",
+    "mask.clip_tools_key_previous": "clip.jump_selected_track_key_previous",
+    "mask.clip_tools_key_next": "clip.jump_selected_track_key_next",
+}
+_KEY_EVENT_FIELDS = ('type', 'value', 'any', 'shift', 'ctrl', 'alt', 'oskey',
+                     'key_modifier', 'direction', 'repeat')
+if 'hyper' in bpy.types.KeyMapItem.bl_rna.properties:
+    _KEY_EVENT_FIELDS += ('hyper',)
+
+
+def migrate_legacy_key_jumps():
+    # Run after keymaps initialize, not during restricted addon registration.
+    wm = bpy.context.window_manager
+    if not wm or not wm.keyconfigs.user:
+        return None
+    keymaps = wm.keyconfigs.user.keymaps
+    legacy = [(keymap, item) for keymap in keymaps for item in keymap.keymap_items
+              if item.idname in _LEGACY_KEY_JUMPS]
+    if not legacy:
+        return None
+    target = keymaps.get("Clip")
+    if target is None:
+        target = keymaps.new(name="Clip", space_type='CLIP_EDITOR', region_type='WINDOW')
+    for keymap, item in legacy:
+        idname = _LEGACY_KEY_JUMPS[item.idname]
+        event = {field: getattr(item, field) for field in _KEY_EVENT_FIELDS}
+        duplicate = next((other for other in target.keymap_items
+                          if other != item and other.idname == idname and other.active == item.active
+                          and all(getattr(other, field) == value for field, value in event.items())), None)
+        if duplicate is not None:
+            keymap.keymap_items.remove(item)
+        elif keymap == target:
+            item.idname = idname
+        else:
+            replacement = target.keymap_items.new(idname, **event)
+            replacement.active = item.active
+            keymap.keymap_items.remove(item)
+    bpy.context.preferences.is_dirty = True
+    return None
 
 
 classes = (
@@ -1300,9 +1419,16 @@ def register():
     bpy.types.Scene.clip_tools_marker_offset_selected_only = BoolProperty(name="Selected Only", default=False)
     bpy.types.Scene.clip_tools_marker_offset_status = StringProperty(name="Status", default="")
     bpy.types.Scene.track_gap_interp_settings = PointerProperty(type=TrackGapInterpSettings)
+    from . import track_bridge_preview
+    track_bridge_preview.register()
+    bpy.app.timers.register(migrate_legacy_key_jumps, first_interval=0.0)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(migrate_legacy_key_jumps):
+        bpy.app.timers.unregister(migrate_legacy_key_jumps)
+    from . import track_bridge_preview
+    track_bridge_preview.unregister()
     global MARKER_OFFSET_CACHE
     global SUPPRESS_MARKER_OFFSET_UPDATE
     MARKER_OFFSET_CACHE = None
